@@ -1,5 +1,5 @@
 [Unit]
-Description=Stars pi webcam service
+Description=Exposes the camera as a UVC device
 
 [Service]
 ExecStart=/home/pi/uvc-gadget/piwebcam
