@@ -42,8 +42,8 @@
 #define WIDTH1  640
 #define HEIGHT1 360
 
-#define WIDTH2	1920
-#define HEIGHT2 1080
+#define WIDTH2	1280
+#define HEIGHT2 720
 
 /* Enable debug prints. */
 #undef ENABLE_BUFFER_DEBUG
