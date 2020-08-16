@@ -1,9 +1,9 @@
 #!/bin/bash
 mkdir /sys/kernel/config/usb_gadget/pi4
 
-echo 0x1d6b > /sys/kernel/config/usb_gadget/pi4/idVendor
-echo 0x0104 > /sys/kernel/config/usb_gadget/pi4/idProduct
-echo 0x0100 > /sys/kernel/config/usb_gadget/pi4/bcdDevice
+echo 0x05ac > /sys/kernel/config/usb_gadget/pi4/idVendor
+echo 0xdead > /sys/kernel/config/usb_gadget/pi4/idProduct
+echo 0x0001 > /sys/kernel/config/usb_gadget/pi4/bcdDevice
 echo 0x0200 > /sys/kernel/config/usb_gadget/pi4/bcdUSB
 
 echo 0xEF > /sys/kernel/config/usb_gadget/pi4/bDeviceClass
@@ -12,8 +12,8 @@ echo 0x01 > /sys/kernel/config/usb_gadget/pi4/bDeviceProtocol
 
 mkdir /sys/kernel/config/usb_gadget/pi4/strings/0x409
 echo 100000000d2386db > /sys/kernel/config/usb_gadget/pi4/strings/0x409/serialnumber
-echo "Samsung" > /sys/kernel/config/usb_gadget/pi4/strings/0x409/manufacturer
-echo "PI4 USB Device" > /sys/kernel/config/usb_gadget/pi4/strings/0x409/product
+echo "Apple" > /sys/kernel/config/usb_gadget/pi4/strings/0x409/manufacturer
+echo "PiSight" > /sys/kernel/config/usb_gadget/pi4/strings/0x409/product
 mkdir /sys/kernel/config/usb_gadget/pi4/configs/c.2
 mkdir /sys/kernel/config/usb_gadget/pi4/configs/c.2/strings/0x409
 echo 500 > /sys/kernel/config/usb_gadget/pi4/configs/c.2/MaxPower
