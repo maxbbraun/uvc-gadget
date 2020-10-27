@@ -9,7 +9,7 @@ sudo /home/pi/uvc-gadget/multi-gadget.sh
 /usr/bin/v4l2-ctl -c exposure_metering_mode=1
 /usr/bin/v4l2-ctl -c contrast=5
 /usr/bin/v4l2-ctl -c brightness=55
-/usr/bin/v4l2-ctl -c saturation=5
+/usr/bin/v4l2-ctl -c saturation=-25
 /usr/bin/v4l2-ctl -c sharpness=100
 sudo /home/pi/uvc-gadget/uvc-gadget -f1 -s2 -r1  -u /dev/video1 -v /dev/video0
 
