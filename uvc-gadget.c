@@ -1,6 +1,23 @@
 /*
- * UVC gadget test application
+ * UVC gadget application
+ * 
+ * Modified by Petr Vavrin (peterbay) <pvavrin@gmail.com>
  *
+ * Github: https://github.com/peterbay/uvc-gadget
+ * 
+ * Added:   video controls
+ *          resolution changing
+ *          framebuffer as source device
+ *          code refactoring
+ *          enhanced logging
+ *          etc.
+ *
+ * Source tree:
+ *   Primary source - wlhe                    - https://github.com/wlhe/uvc-gadget
+ *   Forked source  - climberhunt (Dave Hunt) - https://github.com/climberhunt/uvc-gadget
+ *   Forked source  - peterbay (Petr Vavrin)  - https://github.com/peterbay/uvc-gadget
+ * 
+ * Original author:
  * Copyright (C) 2010 Ideas on board SPRL <laurent.pinchart@ideasonboard.com>
  *
  * This program is free software; you can redistribute it and/or modify
@@ -30,322 +47,551 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include <time.h>
+#include <ftw.h>
 
 #include <linux/usb/ch9.h>
 #include <linux/usb/video.h>
 #include <linux/videodev2.h>
+#include <linux/fb.h>
 
-#include "uvc.h"
+#include "uvc-gadget.h"
 
+volatile sig_atomic_t terminate = 0;
 
-#define WIDTH1  640
-#define HEIGHT1 360
+void term(int signum)
+{
+    (void)(signum); /* avoid warning: unused parameter 'signum' */
+    terminate = 1;
+}
 
-#define WIDTH2	1280
-#define HEIGHT2 720
+static int sys_gpio_write(unsigned int type, char pin[], char value[])
+{
+    FILE * sys_file;
+    char path[255];
 
-/* Enable debug prints. */
-#undef ENABLE_BUFFER_DEBUG
-#undef ENABLE_USB_REQUEST_DEBUG
+    strcpy(path, "/sys/class/gpio/");
 
-#define CLEAR(x) memset(&(x), 0, sizeof(x))
-#define max(a, b) (((a) > (b)) ? (a) : (b))
+    switch(type) {
+        case GPIO_EXPORT:
+            strcat(path, "export");
+            value = pin;
+            break;
 
-#define clamp(val, min, max)                                                                                           \
-    ({                                                                                                                 \
-        typeof(val) __val = (val);                                                                                     \
-        typeof(min) __min = (min);                                                                                     \
-        typeof(max) __max = (max);                                                                                     \
-        (void)(&__val == &__min);                                                                                      \
-        (void)(&__val == &__max);                                                                                      \
-        __val = __val < __min ? __min : __val;                                                                         \
-        __val > __max ? __max : __val;                                                                                 \
-    })
+        case GPIO_DIRECTION:
+            strcat(path, "gpio");
+            strcat(path, pin);
+            strcat(path, "/direction");
+            break;
 
-#define ARRAY_SIZE(a) ((sizeof(a) / sizeof(a[0])))
-#define pixfmtstr(x) (x) & 0xff, ((x) >> 8) & 0xff, ((x) >> 16) & 0xff, ((x) >> 24) & 0xff
+        case GPIO_VALUE:
+            strcat(path, "gpio");
+            strcat(path, pin);
+            strcat(path, "/value");
+            break;
+    }
 
-/*
- * The UVC webcam gadget kernel driver (g_webcam.ko) supports changing
- * the Brightness attribute of the Processing Unit (PU). by default. If
- * the underlying video capture device supports changing the Brightness
- * attribute of the image being acquired (like the Virtual Video, VIVI
- * driver), then we should route this UVC request to the respective
- * video capture device.
- *
- * Incase, there is no actual video capture device associated with the
- * UVC gadget and we wish to use this application as the final
- * destination of the UVC specific requests then we should return
- * pre-cooked (static) responses to GET_CUR(BRIGHTNESS) and
- * SET_CUR(BRIGHTNESS) commands to keep command verifier test tools like
- * UVC class specific test suite of USBCV, happy.
- *
- * Note that the values taken below are in sync with the VIVI driver and
- * must be changed for your specific video capture device. These values
- * also work well in case there in no actual video capture device.
- */
-#define PU_BRIGHTNESS_MIN_VAL 0
-#define PU_BRIGHTNESS_MAX_VAL 255
-#define PU_BRIGHTNESS_STEP_SIZE 1
-#define PU_BRIGHTNESS_DEFAULT_VAL 55
+    printf("GPIO WRITE: Path: %s, Value: %s\n", path, value);
 
-/* ---------------------------------------------------------------------------
- * Generic stuff
- */
+    sys_file = fopen(path, "w");
+    if (!sys_file) {
+        printf("GPIO ERROR: File write failed: %s (%d).\n", strerror(errno), errno);
+        return -1;
+    }
 
-/* IO methods supported */
-enum io_method {
-    IO_METHOD_MMAP,
-    IO_METHOD_USERPTR,
-};
+    fwrite(value, 1, strlen(value), sys_file);
+    fclose(sys_file);
+   
+    return 0;
+}
 
-/* Buffer representing one video frame */
-struct buffer {
-    struct v4l2_buffer buf;
-    void *start;
-    size_t length;
-};
+static int sys_led_write(unsigned int type, char value[])
+{
+    FILE * sys_file;
+    char path[255];
 
-/* ---------------------------------------------------------------------------
- * UVC specific stuff
- */
+    strcpy(path, "/sys/class/leds/led0/");
 
-struct uvc_frame_info {
-    unsigned int width;
-    unsigned int height;
-    unsigned int intervals[8];
-};
+    switch(type) {
+        case LED_TRIGGER:
+            strcat(path, "trigger");
+            break;
 
-struct uvc_format_info {
-    unsigned int fcc;
-    const struct uvc_frame_info *frames;
-};
+        case LED_BRIGHTNESS:
+            strcat(path, "brightness");
+            break;
+    }
 
-static const struct uvc_frame_info uvc_frames_yuyv[] = {
-    {
-        WIDTH1,
-        HEIGHT1,
-        //{666666, 10000000, 50000000, 0},
-        {50000000, 0},
-    },
-    {
-        WIDTH2,
-        HEIGHT2,
-        {50000000, 0},
-    },
-    {
-        0,
-        0,
-        {
-            0,
-        },
-    },
-};
+    printf("LED WRITE: Path: %s, Value: %s\n", path, value);
 
-static const struct uvc_frame_info uvc_frames_mjpeg[] = {
-    {
-        WIDTH1,
-        HEIGHT1,
-        //{666666, 10000000, 50000000, 0},
-        {50000000, 0},
-    },
-    {
-        WIDTH2,
-        HEIGHT2,
-        {50000000, 0},
-    },
-    {
-        0,
-        0,
-        {
-            0,
-        },
-    },
-};
+    sys_file = fopen(path, "w");
+    if (!sys_file) {
+        printf("LED ERROR: File write failed: %s (%d).\n", strerror(errno), errno);
+        return -1;
+    }
 
-static const struct uvc_format_info uvc_formats[] = {
-    {V4L2_PIX_FMT_YUYV, uvc_frames_yuyv},
-    {V4L2_PIX_FMT_MJPEG, uvc_frames_mjpeg},
-};
+    fwrite(value, 1, strlen(value), sys_file);
+    fclose(sys_file);
+   
+    return 0;
+}
 
-/* ---------------------------------------------------------------------------
- * V4L2 and UVC device instances
- */
+static void streaming_status_enable()
+{
+    int ret;
+    if (!settings.streaming_status_enabled && settings.streaming_status_pin) {
+        ret = sys_gpio_write(GPIO_EXPORT, settings.streaming_status_pin, NULL);
+        if (ret < 0) {
+            return;
+        }
 
-/* Represents a V4L2 based video capture device */
-struct v4l2_device {
-    /* v4l2 device specific */
-    int v4l2_fd;
-    int is_streaming;
-    char *v4l2_devname;
+        ret = sys_gpio_write(GPIO_DIRECTION, settings.streaming_status_pin, GPIO_DIRECTION_OUT);
+        if (ret < 0) {
+            return;
+        }
 
-    /* v4l2 buffer specific */
-    enum io_method io;
-    struct buffer *mem;
-    unsigned int nbufs;
+        ret = sys_gpio_write(GPIO_VALUE, settings.streaming_status_pin, GPIO_VALUE_OFF);
+        if (ret < 0) {
+            return;
+        }
 
-    /* v4l2 buffer queue and dequeue counters */
-    unsigned long long int qbuf_count;
-    unsigned long long int dqbuf_count;
+        settings.streaming_status_enabled = true;
+    }
 
-    /* uvc device hook */
-    struct uvc_device *udev;
-};
+    if (settings.streaming_status_onboard) {
+        ret = sys_led_write(LED_TRIGGER, LED_TRIGGER_NONE);
+        if (ret < 0) {
+            return;
+        }
 
-/* Represents a UVC based video output device */
-struct uvc_device {
-    /* uvc device specific */
-    int uvc_fd;
-    int is_streaming;
-    int run_standalone;
-    char *uvc_devname;
+        ret = sys_led_write(LED_BRIGHTNESS, LED_BRIGHTNESS_LOW);
+        if (ret < 0) {
+            return;
+        }
+        settings.streaming_status_onboard_enabled = true;
+    }
+    return;
+}
 
-    /* uvc control request specific */
+static void streaming_status_value(bool state)
+{
+    char * gpio_value = (state) ? GPIO_VALUE_ON : GPIO_VALUE_OFF;
+    char * led_value = (state) ? LED_BRIGHTNESS_HIGH : LED_BRIGHTNESS_LOW;
 
-    struct uvc_streaming_control probe;
-    struct uvc_streaming_control commit;
-    int control;
-    struct uvc_request_data request_error_code;
-    unsigned int brightness_val;
+    if (settings.streaming_status_enabled) {
+        sys_gpio_write(GPIO_VALUE, settings.streaming_status_pin, gpio_value);
+    }
 
-    /* uvc buffer specific */
-    enum io_method io;
-    struct buffer *mem;
-    struct buffer *dummy_buf;
-    unsigned int nbufs;
-    unsigned int fcc;
-    unsigned int width;
-    unsigned int height;
+    if (settings.streaming_status_onboard_enabled) {
+        sys_led_write(LED_BRIGHTNESS, led_value);
+    }
+}
 
-    unsigned int bulk;
-    uint8_t color;
-    unsigned int imgsize;
-    void *imgdata;
+static char * uvc_request_code_name(unsigned int uvc_control)
+{
+    switch (uvc_control) {
+    case UVC_RC_UNDEFINED:
+        return "RC_UNDEFINED";
 
-    /* USB speed specific */
-    int mult;
-    int burst;
-    int maxpkt;
-    enum usb_device_speed speed;
+    case UVC_SET_CUR:
+        return "SET_CUR";
 
-    /* uvc specific flags */
-    int first_buffer_queued;
-    int uvc_shutdown_requested;
+    case UVC_GET_CUR:
+        return "GET_CUR";
 
-    /* uvc buffer queue and dequeue counters */
-    unsigned long long int qbuf_count;
-    unsigned long long int dqbuf_count;
+    case UVC_GET_MIN:
+        return "GET_MIN";
 
-    /* v4l2 device hook */
-    struct v4l2_device *vdev;
-};
+    case UVC_GET_MAX:
+        return "GET_MAX";
 
-/* forward declarations */
-static int uvc_video_stream(struct uvc_device *dev, int enable);
+    case UVC_GET_RES:
+        return "GET_RES";
+
+    case UVC_GET_LEN:
+        return "GET_LEN";
+
+    case UVC_GET_INFO:
+        return "GET_INFO";
+
+    case UVC_GET_DEF:
+        return "GET_DEF";
+
+    default:
+        return "UNKNOWN";
+
+    }
+}
+
+static char * uvc_vs_interface_control_name(unsigned int interface)
+{
+    switch (interface) {
+    case UVC_VS_CONTROL_UNDEFINED:
+        return "CONTROL_UNDEFINED";
+
+    case UVC_VS_PROBE_CONTROL:
+        return "PROBE";
+
+    case UVC_VS_COMMIT_CONTROL:
+        return "COMMIT";
+
+    case UVC_VS_STILL_PROBE_CONTROL:
+        return "STILL_PROBE";
+
+    case UVC_VS_STILL_COMMIT_CONTROL:
+        return "STILL_COMMIT";
+
+    case UVC_VS_STILL_IMAGE_TRIGGER_CONTROL:
+        return "STILL_IMAGE_TRIGGER";
+
+    case UVC_VS_STREAM_ERROR_CODE_CONTROL:
+        return "STREAM_ERROR_CODE";
+
+    case UVC_VS_GENERATE_KEY_FRAME_CONTROL:
+        return "GENERATE_KEY_FRAME";
+
+    case UVC_VS_UPDATE_FRAME_SEGMENT_CONTROL:
+        return "UPDATE_FRAME_SEGMENT";
+
+    case UVC_VS_SYNC_DELAY_CONTROL:
+        return "SYNC_DELAY";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static unsigned int get_frame_size(int pixelformat, int width, int height)
+{
+    switch (pixelformat) {
+    case V4L2_PIX_FMT_YUYV:
+        return width * height * 2;
+
+    case V4L2_PIX_FMT_MJPEG:
+        return width * height;
+        break;
+    }
+
+    return width * height;
+}
+
+static int v4l2_open(char * devname, unsigned int nbufs)
+{
+    struct v4l2_capability cap;
+    const char * type_name = "DEVICE_V4L2";
+
+    printf("%s: Opening %s device\n", type_name, devname);
+
+    v4l2_dev.fd = open(devname, O_RDWR | O_NONBLOCK, 0);
+    if (v4l2_dev.fd == -1) {
+        printf("%s: Device open failed: %s (%d).\n", type_name, strerror(errno), errno);
+        return -EINVAL;
+    }
+
+    if (ioctl(v4l2_dev.fd, VIDIOC_QUERYCAP, &cap) < 0) {
+        printf("%s: VIDIOC_QUERYCAP failed: %s (%d).\n", type_name, strerror(errno), errno);
+        goto err;
+    }
+
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+        printf("%s: %s is no video capture device\n", type_name, devname);
+        goto err;
+    }
+
+    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+        printf("%s: %s does not support streaming i/o\n", type_name, devname);
+        goto err;
+    }
+
+    printf("%s: Device is %s on bus %s\n", type_name, cap.card, cap.bus_info);
+
+    v4l2_dev.device_type      = DEVICE_TYPE_UVC;
+    v4l2_dev.device_type_name = type_name;
+    v4l2_dev.buffer_type      = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    v4l2_dev.memory_type      = V4L2_MEMORY_MMAP;
+    v4l2_dev.nbufs            = nbufs;
+    return 1;
+
+err:
+    close(v4l2_dev.fd);
+    v4l2_dev.fd = -1;
+    return -EINVAL;
+}
+
+static int uvc_open( char * devname, unsigned int nbufs)
+{
+    struct v4l2_capability cap;
+    const char * type_name = "DEVICE_UVC";
+
+    printf("%s: Opening %s device\n", type_name, devname);
+
+    uvc_dev.fd = open(devname, O_RDWR | O_NONBLOCK, 0);
+    if (uvc_dev.fd == -1) {
+        printf("%s: Device open failed: %s (%d).\n", type_name, strerror(errno), errno);
+        return -EINVAL;
+    }
+
+    if (ioctl(uvc_dev.fd, VIDIOC_QUERYCAP, &cap) < 0) {
+        printf("%s: VIDIOC_QUERYCAP failed: %s (%d).\n", type_name, strerror(errno), errno);
+        goto err;
+    }
+
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_OUTPUT)) {
+        printf("%s: %s is no video output device\n", type_name, devname);
+        goto err;
+    }
+
+    printf("%s: Device is %s on bus %s\n", type_name, cap.card, cap.bus_info);
+
+    uvc_dev.device_type      = DEVICE_TYPE_UVC;
+    uvc_dev.device_type_name = type_name;
+    uvc_dev.buffer_type      = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    uvc_dev.memory_type      = V4L2_MEMORY_USERPTR;
+    uvc_dev.nbufs            = nbufs;
+    return 1;
+
+err:
+    close(uvc_dev.fd);
+    uvc_dev.fd = -1;
+    return -EINVAL;
+}
+
+static void fb_show_info()
+{
+    printf("FB: Resolution: %dx%d\n", fb_dev.fb_width, fb_dev.fb_height);
+    printf("FB: Bits per pixel: %d\n", fb_dev.fb_bpp);
+    printf("FB: Line length: %d\n", fb_dev.fb_line_length);
+    printf("FB: Memory size: %d\n", fb_dev.fb_mem_size);
+}
+
+static int fb_get_settings()
+{
+    struct fb_var_screeninfo fb_info;
+    struct fb_fix_screeninfo mode_info;
+
+    if (ioctl(fb_dev.fd, FBIOGET_VSCREENINFO, &fb_info) < 0) {
+        printf("FB: Can't get framebuffer info: %s (%d).\n", strerror(errno), errno);
+        return -EINVAL;
+    }
+
+    if (ioctl(fb_dev.fd, FBIOGET_FSCREENINFO, &mode_info)) {
+        printf("FB: Can't get framebuffer screen info: %s (%d).\n", strerror(errno), errno);
+        return -EINVAL;
+    }
+
+    fb_dev.fb_screen_size = fb_info.xres * fb_info.yres * fb_info.bits_per_pixel / 8;
+    fb_dev.fb_mem_size    = mode_info.smem_len;
+    fb_dev.fb_bpp         = fb_info.bits_per_pixel;
+    fb_dev.fb_line_length = mode_info.line_length;
+    fb_dev.fb_width       = fb_info.xres;
+    fb_dev.fb_height      = fb_info.yres;
+
+    fb_show_info();
+    return 1;
+}
+
+static int fb_open(char * devname)
+{
+    printf("FB: Opening %s device\n", devname);
+
+    fb_dev.fd = open(devname, O_RDWR);
+    if (fb_dev.fd < 0) {
+        printf("FB: Device open failed: %s (%d).\n", strerror(errno), errno);
+        goto err;
+    }
+
+    fb_dev.device_type = DEVICE_TYPE_FRAMEBUFFER;
+
+    if (fb_get_settings() < 0) {
+        goto err;
+    }
+
+    return 1;
+
+err:
+    close(fb_dev.fd);
+    fb_dev.fd = -1;
+    return -EINVAL;
+}
+
+static int fb_mmap_open() 
+{
+    fb_dev.fb_memory = mmap(0,
+        fb_dev.fb_mem_size, PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        fb_dev.fd,
+        0
+    );
+    if (fb_dev.fb_memory == MAP_FAILED) {
+        printf("FB: Can't get framebuffer mmap: %s (%d).\n", strerror(errno), errno);
+        fb_dev.fb_memory = NULL;
+        return -EINVAL;
+    }
+
+    return 1;
+}
+
+static void fb_mmap_close() 
+{
+    if (fb_dev.fb_memory) {
+        munmap(fb_dev.fb_memory, 0);
+        fb_dev.fb_memory = NULL;
+    }
+}
 
 /* ---------------------------------------------------------------------------
  * V4L2 streaming related
  */
 
-static int v4l2_uninit_device(struct v4l2_device *dev)
+static void v4l2_uninit_device()
 {
     unsigned int i;
+    if (!v4l2_dev.mem) {
+        return;
+    }
+    printf("%s: Uninit device\n", v4l2_dev.device_type_name);
+
+    for (i = 0; i < v4l2_dev.nbufs; ++i) {
+        if (munmap(v4l2_dev.mem[i].start, v4l2_dev.mem[i].length) < 0) {
+            printf("%s: munmap failed\n", v4l2_dev.device_type_name);
+            return;
+        }
+    }
+    free(v4l2_dev.mem);
+    v4l2_dev.mem = NULL;
+}
+
+static void uvc_uninit_device()
+{
+    unsigned int i;
+    if (settings.source_device == DEVICE_TYPE_FRAMEBUFFER && uvc_dev.dummy_buf) {
+        printf("%s: Uninit device\n", uvc_dev.device_type_name);
+
+        for (i = 0; i < uvc_dev.nbufs; ++i) {
+            free(uvc_dev.dummy_buf[i].start);
+            uvc_dev.dummy_buf[i].start = NULL;
+        }
+        free(uvc_dev.dummy_buf);
+        uvc_dev.dummy_buf = NULL;
+    }
+}
+
+static int v4l2_video_stream_control(struct v4l2_device * dev, enum video_stream_action action)
+{
+    int type = dev->buffer_type;
     int ret;
 
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        for (i = 0; i < dev->nbufs; ++i) {
-            ret = munmap(dev->mem[i].start, dev->mem[i].length);
-            if (ret < 0) {
-                printf("V4L2: munmap failed\n");
-                return ret;
-            }
+    if (action == STREAM_ON) {
+        ret = ioctl(dev->fd, VIDIOC_STREAMON, &type);
+        if (ret < 0) {
+            printf("%s: STREAM ON failed: %s (%d).\n", dev->device_type_name, strerror(errno), errno);
+            return ret;
         }
 
-        free(dev->mem);
-        break;
+        printf("%s: STREAM ON success\n", dev->device_type_name);
+        dev->is_streaming = 1;
+        uvc_shutdown_requested = false;
 
-    case IO_METHOD_USERPTR:
-    default:
-        break;
+    } else if (dev->is_streaming) {
+        ret = ioctl(dev->fd, VIDIOC_STREAMOFF, &type);
+        if (ret < 0) {
+            printf("%s: STREAM OFF failed: %s (%d).\n", dev->device_type_name, strerror(errno), errno);
+            return ret;
+        }
+
+        printf("%s: STREAM OFF success\n", dev->device_type_name);
+        dev->is_streaming = 0;
     }
-
     return 0;
 }
 
-static int v4l2_reqbufs_mmap(struct v4l2_device *dev, int nbufs)
+static int v4l2_video_stream(enum video_stream_action action)
 {
-    struct v4l2_requestbuffers req;
-    unsigned int i = 0;
+    return v4l2_video_stream_control(&v4l2_dev, action);
+}
+
+static int uvc_video_stream(enum video_stream_action action)
+{
+    return v4l2_video_stream_control(&uvc_dev, action);
+}
+
+static int v4l2_init_buffers(struct v4l2_device * dev, struct v4l2_requestbuffers * req,
+    unsigned int count)
+{
     int ret;
+    req->count  = count;
+    req->type   = dev->buffer_type;
+    req->memory = dev->memory_type;
 
-    CLEAR(req);
-
-    req.count = nbufs;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-
-    ret = ioctl(dev->v4l2_fd, VIDIOC_REQBUFS, &req);
+    ret = ioctl(dev->fd, VIDIOC_REQBUFS, req);
     if (ret < 0) {
-        if (ret == -EINVAL)
-            printf("V4L2: does not support memory mapping\n");
-        else
-            printf("V4L2: VIDIOC_REQBUFS error %s (%d).\n", strerror(errno), errno);
-        goto err;
-    }
+        if (ret == -EINVAL) {
+            printf("%s: Does not support %s\n", dev->device_type_name,
+                (dev->memory_type == V4L2_MEMORY_USERPTR) ? "user pointer i/o" : "memory mapping");
 
-    if (!req.count)
-        return 0;
+        } else {
+            printf("%s: VIDIOC_REQBUFS error: %s (%d).\n",
+                dev->device_type_name, strerror(errno), errno);
 
-    if (req.count < 2) {
-        printf("V4L2: Insufficient buffer memory.\n");
-        ret = -EINVAL;
-        goto err;
+        }
+        return ret;
     }
+    return count;
+}
+
+static int v4l2_reqbufs_mmap(struct v4l2_device * dev, struct v4l2_requestbuffers req)
+{
+    int ret;
+    unsigned int i = 0;
 
     /* Map the buffers. */
     dev->mem = calloc(req.count, sizeof dev->mem[0]);
     if (!dev->mem) {
-        printf("V4L2: Out of memory\n");
+        printf("%s: Out of memory\n", dev->device_type_name);
         ret = -ENOMEM;
         goto err;
     }
 
     for (i = 0; i < req.count; ++i) {
-        memset(&dev->mem[i].buf, 0, sizeof(dev->mem[i].buf));
+        CLEAR(dev->mem[i].buf);
 
-        dev->mem[i].buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        dev->mem[i].buf.type   = dev->buffer_type;
         dev->mem[i].buf.memory = V4L2_MEMORY_MMAP;
-        dev->mem[i].buf.index = i;
+        dev->mem[i].buf.index  = i;
 
-        ret = ioctl(dev->v4l2_fd, VIDIOC_QUERYBUF, &(dev->mem[i].buf));
+        ret = ioctl(dev->fd, VIDIOC_QUERYBUF, &(dev->mem[i].buf));
         if (ret < 0) {
-            printf(
-                "V4L2: VIDIOC_QUERYBUF failed for buf %d: "
-                "%s (%d).\n",
-                i, strerror(errno), errno);
+            printf("%s: VIDIOC_QUERYBUF failed for buf %d: %s (%d).\n",
+                dev->device_type_name, i, strerror(errno), errno);
+
             ret = -EINVAL;
             goto err_free;
         }
 
         dev->mem[i].start =
-            mmap(NULL /* start anywhere */, dev->mem[i].buf.length, PROT_READ | PROT_WRITE /* required */,
-                 MAP_SHARED /* recommended */, dev->v4l2_fd, dev->mem[i].buf.m.offset);
+            mmap(NULL /* start anywhere */,
+                dev->mem[i].buf.length,
+                PROT_READ | PROT_WRITE /* required */,
+                MAP_SHARED /* recommended */,
+                dev->fd, dev->mem[i].buf.m.offset
+            );
 
         if (MAP_FAILED == dev->mem[i].start) {
-            printf("V4L2: Unable to map buffer %u: %s (%d).\n", i, strerror(errno), errno);
+            printf("%s: Unable to map buffer %u: %s (%d).\n",
+                dev->device_type_name, i, strerror(errno), errno);
+
             dev->mem[i].length = 0;
             ret = -EINVAL;
             goto err_free;
         }
 
         dev->mem[i].length = dev->mem[i].buf.length;
-        printf("V4L2: Buffer %u mapped at address %p, length %d.\n", i, dev->mem[i].start, dev->mem[i].length);
+        printf("%s: Buffer %u mapped at address %p, length %d.\n",
+            dev->device_type_name, i, dev->mem[i].start, dev->mem[i].length);
     }
-
-    dev->nbufs = req.count;
-    printf("V4L2: %u buffers allocated.\n", req.count);
 
     return 0;
 
@@ -355,1341 +601,984 @@ err:
     return ret;
 }
 
-static int v4l2_reqbufs_userptr(struct v4l2_device *dev, int nbufs)
+static int v4l2_reqbufs_userptr(struct v4l2_device * dev, struct v4l2_requestbuffers req)
 {
-    struct v4l2_requestbuffers req;
-    int ret;
+    unsigned int payload_size;
+    unsigned int i;
 
-    CLEAR(req);
+    if (dev->device_type == DEVICE_TYPE_UVC && settings.source_device == DEVICE_TYPE_FRAMEBUFFER) {
+        /* Allocate buffers to hold dummy data pattern. */
+        dev->dummy_buf = calloc(req.count, sizeof dev->dummy_buf[0]);
+        if (!dev->dummy_buf) {
+            printf("%s: Out of memory\n", dev->device_type_name);
+            return -ENOMEM;
+        }
 
-    req.count = nbufs;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_USERPTR;
+        payload_size = fb_dev.fb_width * fb_dev.fb_height * 2;
 
-    ret = ioctl(dev->v4l2_fd, VIDIOC_REQBUFS, &req);
-    if (ret < 0) {
-        if (ret == -EINVAL)
-            printf("V4L2: does not support user pointer i/o\n");
-        else
-            printf("V4L2: VIDIOC_REQBUFS error %s (%d).\n", strerror(errno), errno);
-        return ret;
+        for (i = 0; i < req.count; ++i) {
+            dev->dummy_buf[i].length = payload_size;
+            dev->dummy_buf[i].start  = malloc(payload_size);
+            if (!dev->dummy_buf[i].start) {
+                printf("%s: Out of memory\n", dev->device_type_name);
+                return -ENOMEM;
+            }
+        }
+
+        dev->mem = dev->dummy_buf;
+
     }
-
-    dev->nbufs = req.count;
-    printf("V4L2: %u buffers allocated.\n", req.count);
-
     return 0;
 }
 
-static int v4l2_reqbufs(struct v4l2_device *dev, int nbufs)
+static int v4l2_reqbufs(struct v4l2_device * dev, int nbufs)
 {
     int ret = 0;
+    struct v4l2_requestbuffers req;
+    CLEAR(req);
 
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        ret = v4l2_reqbufs_mmap(dev, nbufs);
-        break;
+    dev->dqbuf_count = 0;
+    dev->qbuf_count = 0;
 
-    case IO_METHOD_USERPTR:
-        ret = v4l2_reqbufs_userptr(dev, nbufs);
-        break;
-
-    default:
-        ret = -EINVAL;
-        break;
+    ret = v4l2_init_buffers(dev, &req, nbufs);
+    if (ret < 1) {
+        return ret;
     }
+
+    if (!req.count) {
+        return 0;
+    }
+
+    if (dev->memory_type == V4L2_MEMORY_MMAP) {
+        if (req.count < 2) {
+            printf("%s: Insufficient buffer memory.\n", dev->device_type_name);
+            return -EINVAL;
+        }
+
+        ret = v4l2_reqbufs_mmap(dev, req);
+        if (ret < 0) {
+            return -EINVAL;
+        }
+    }
+
+    if (dev->memory_type == V4L2_MEMORY_USERPTR && settings.source_device == DEVICE_TYPE_FRAMEBUFFER) {
+        if (req.count < 2) {
+            printf("%s: Insufficient buffer memory.\n", dev->device_type_name);
+            return -EINVAL;
+        }
+
+        ret = v4l2_reqbufs_userptr(dev, req);
+        if (ret < 0) {
+            return -EINVAL;
+        }
+    }
+
+    dev->nbufs = req.count;
+    printf("%s: %u buffers allocated.\n", dev->device_type_name, req.count);
 
     return ret;
 }
 
-static int v4l2_qbuf_mmap(struct v4l2_device *dev)
+static int v4l2_request_bufs(int nbufs)
+{
+    return v4l2_reqbufs(&v4l2_dev, nbufs);
+}
+
+static int uvc_request_bufs(int nbufs)
+{
+    return v4l2_reqbufs(&uvc_dev, nbufs);
+}
+
+static int uvc_video_qbuf()
+{
+    unsigned int i;
+    int ret;
+
+    if (settings.source_device == DEVICE_TYPE_FRAMEBUFFER) {
+        for (i = 0; i < uvc_dev.nbufs; ++i) {
+            struct v4l2_buffer buf;
+
+            CLEAR(buf);
+            buf.type      = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+            buf.memory    = V4L2_MEMORY_USERPTR;
+            buf.m.userptr = (unsigned long) uvc_dev.dummy_buf[i].start;
+            buf.length    = uvc_dev.dummy_buf[i].length;
+            buf.index     = i;
+
+            ret = ioctl(uvc_dev.fd, VIDIOC_QBUF, &buf);
+            if (ret < 0) {
+                printf("UVC: VIDIOC_QBUF failed : %s (%d).\n", strerror(errno), errno);
+                return ret;
+            }
+
+            uvc_dev.qbuf_count++;
+        }
+    }
+    return 0;
+}
+
+static int v4l2_qbuf_mmap(struct v4l2_device * dev)
 {
     unsigned int i;
     int ret;
 
     for (i = 0; i < dev->nbufs; ++i) {
-        memset(&dev->mem[i].buf, 0, sizeof(dev->mem[i].buf));
+        CLEAR(dev->mem[i].buf);
 
-        dev->mem[i].buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        dev->mem[i].buf.type   = dev->buffer_type;
         dev->mem[i].buf.memory = V4L2_MEMORY_MMAP;
-        dev->mem[i].buf.index = i;
+        dev->mem[i].buf.index  = i;
 
-        ret = ioctl(dev->v4l2_fd, VIDIOC_QBUF, &(dev->mem[i].buf));
+        ret = ioctl(dev->fd, VIDIOC_QBUF, &(dev->mem[i].buf));
         if (ret < 0) {
-            printf("V4L2: VIDIOC_QBUF failed : %s (%d).\n", strerror(errno), errno);
+            printf("%s: VIDIOC_QBUF failed : %s (%d).\n",
+                dev->device_type_name, strerror(errno), errno);
+
             return ret;
         }
-
         dev->qbuf_count++;
     }
-
     return 0;
 }
 
-static int v4l2_qbuf(struct v4l2_device *dev)
+static void v4l2_uvc_video_process()
 {
-    int ret = 0;
-
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        ret = v4l2_qbuf_mmap(dev);
-        break;
-
-    case IO_METHOD_USERPTR:
-        /* Empty. */
-        ret = 0;
-        break;
-
-    default:
-        ret = -EINVAL;
-        break;
-    }
-
-    return ret;
-}
-
-static int v4l2_process_data(struct v4l2_device *dev)
-{
-    int ret;
     struct v4l2_buffer vbuf;
     struct v4l2_buffer ubuf;
 
-    /* Return immediately if V4l2 streaming has not yet started. */
-    if (!dev->is_streaming)
-        return 0;
+    if (uvc_dev.is_streaming && v4l2_dev.dqbuf_count >= v4l2_dev.qbuf_count) {
+        return;
+    }
 
-    if (dev->udev->first_buffer_queued)
-        if (dev->dqbuf_count >= dev->qbuf_count)
-            return 0;
-
-    /* Dequeue spent buffer rom V4L2 domain. */
+    /* Dequeue spent buffer from V4L2 domain. */
     CLEAR(vbuf);
+    vbuf.type   = v4l2_dev.buffer_type;
+    vbuf.memory = v4l2_dev.memory_type;
 
-    vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    switch (dev->io) {
-    case IO_METHOD_USERPTR:
-        vbuf.memory = V4L2_MEMORY_USERPTR;
-        break;
-
-    case IO_METHOD_MMAP:
-    default:
-        vbuf.memory = V4L2_MEMORY_MMAP;
-        break;
+    if (ioctl(v4l2_dev.fd, VIDIOC_DQBUF, &vbuf) < 0) {
+        printf("%s: Unable to dequeue buffer: %s (%d).\n",
+            v4l2_dev.device_type_name, strerror(errno), errno);
+        return;
     }
 
-    ret = ioctl(dev->v4l2_fd, VIDIOC_DQBUF, &vbuf);
-    if (ret < 0) {
-        return ret;
-    }
-
-    dev->dqbuf_count++;
-
-#ifdef ENABLE_BUFFER_DEBUG
-    printf("Dequeueing buffer at V4L2 side = %d\n", vbuf.index);
-#endif
+    v4l2_dev.dqbuf_count++;
 
     /* Queue video buffer to UVC domain. */
     CLEAR(ubuf);
+    ubuf.type      = uvc_dev.buffer_type;
+    ubuf.memory    = uvc_dev.memory_type;
+    ubuf.m.userptr = (unsigned long) v4l2_dev.mem[vbuf.index].start;
+    ubuf.length    = v4l2_dev.mem[vbuf.index].length;
+    ubuf.index     = vbuf.index;
+    ubuf.bytesused = vbuf.bytesused;
 
-    ubuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    switch (dev->udev->io) {
-    case IO_METHOD_MMAP:
-        ubuf.memory = V4L2_MEMORY_MMAP;
-        ubuf.length = vbuf.length;
-        ubuf.index = vbuf.index;
-        ubuf.bytesused = vbuf.bytesused;
-        break;
-
-    case IO_METHOD_USERPTR:
-    default:
-        ubuf.memory = V4L2_MEMORY_USERPTR;
-        ubuf.m.userptr = (unsigned long)dev->mem[vbuf.index].start;
-        ubuf.length = dev->mem[vbuf.index].length;
-        ubuf.index = vbuf.index;
-        ubuf.bytesused = vbuf.bytesused;
-        break;
-    }
-
-    ret = ioctl(dev->udev->uvc_fd, VIDIOC_QBUF, &ubuf);
-    if (ret < 0) {
+    if (ioctl(uvc_dev.fd, VIDIOC_QBUF, &ubuf) < 0) {
         /* Check for a USB disconnect/shutdown event. */
         if (errno == ENODEV) {
-            dev->udev->uvc_shutdown_requested = 1;
-            printf(
-                "UVC: Possible USB shutdown requested from "
-                "Host, seen during VIDIOC_QBUF\n");
-            return 0;
-        } else {
-            return ret;
+            uvc_shutdown_requested = true;
+            printf("UVC: Possible USB shutdown requested from Host, seen during VIDIOC_QBUF\n");
         }
+        return;
     }
 
-    dev->udev->qbuf_count++;
+    uvc_dev.qbuf_count++;
 
-#ifdef ENABLE_BUFFER_DEBUG
-    printf("Queueing buffer at UVC side = %d\n", ubuf.index);
-#endif
-
-    if (!dev->udev->first_buffer_queued && !dev->udev->run_standalone) {
-        uvc_video_stream(dev->udev, 1);
-        dev->udev->first_buffer_queued = 1;
-        dev->udev->is_streaming = 1;
+    if (!uvc_dev.is_streaming) {
+        uvc_video_stream(STREAM_ON);
+        settings.blink_on_startup = 0;
+        streaming_status_value(uvc_dev.is_streaming);
     }
-
-    return 0;
 }
 
 /* ---------------------------------------------------------------------------
  * V4L2 generic stuff
  */
 
-static int v4l2_get_format(struct v4l2_device *dev)
+static int v4l2_get_format(struct v4l2_device * dev)
 {
     struct v4l2_format fmt;
     int ret;
 
     CLEAR(fmt);
-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.type = dev->buffer_type;
 
-    ret = ioctl(dev->v4l2_fd, VIDIOC_G_FMT, &fmt);
+    ret = ioctl(dev->fd, VIDIOC_G_FMT, &fmt);
     if (ret < 0) {
         return ret;
     }
 
-    printf("V4L2: Getting current format: %c%c%c%c %ux%u\n", pixfmtstr(fmt.fmt.pix.pixelformat), fmt.fmt.pix.width,
-           fmt.fmt.pix.height);
+    printf("%s: Getting current format: %c%c%c%c %ux%u\n",
+        dev->device_type_name, pixfmtstr(fmt.fmt.pix.pixelformat),
+        fmt.fmt.pix.width, fmt.fmt.pix.height);
 
     return 0;
 }
 
-static int v4l2_set_format(struct v4l2_device *dev, struct v4l2_format *fmt)
+static int v4l2_set_format(struct v4l2_device * dev, struct v4l2_format * fmt)
 {
     int ret;
 
-    ret = ioctl(dev->v4l2_fd, VIDIOC_S_FMT, fmt);
+    ret = ioctl(dev->fd, VIDIOC_S_FMT, fmt);
     if (ret < 0) {
-        printf("V4L2: Unable to set format %s (%d).\n", strerror(errno), errno);
+        printf("%s: Unable to set format %s (%d).\n",
+            dev->device_type_name, strerror(errno), errno);
         return ret;
     }
 
-    printf("V4L2: Setting format to: %c%c%c%c %ux%u\n", pixfmtstr(fmt->fmt.pix.pixelformat), fmt->fmt.pix.width,
-           fmt->fmt.pix.height);
+    printf("%s: Setting format to: %c%c%c%c %ux%u\n",
+        dev->device_type_name, pixfmtstr(fmt->fmt.pix.pixelformat),
+        fmt->fmt.pix.width, fmt->fmt.pix.height);
 
     return 0;
 }
 
-static int v4l2_set_ctrl(struct v4l2_device *dev, int new_val, int ctrl)
+static int v4l2_apply_format(struct v4l2_device * dev, unsigned int pixelformat,
+    unsigned int width, unsigned int height)
+{
+    struct v4l2_format fmt;
+    int ret = -EINVAL;
+
+    if (dev->is_streaming || !dev->fd) {
+        return ret;
+    }
+
+    CLEAR(fmt);
+    fmt.type                = dev->buffer_type;
+    fmt.fmt.pix.width       = width;
+    fmt.fmt.pix.height      = height;
+    fmt.fmt.pix.sizeimage   = get_frame_size(pixelformat, width, height);
+    fmt.fmt.pix.pixelformat = pixelformat;
+    fmt.fmt.pix.field       = V4L2_FIELD_ANY;
+
+    ret = v4l2_set_format(dev, &fmt);
+    if (ret < 0) {
+        return ret;
+    }
+
+    return v4l2_get_format(dev);
+}
+
+static void v4l2_set_ctrl_value(struct control_mapping_pair ctrl, unsigned int ctrl_v4l2, int v4l2_ctrl_value)
 {
     struct v4l2_queryctrl queryctrl;
     struct v4l2_control control;
-    int ret;
-
     CLEAR(queryctrl);
 
-    switch (ctrl) {
-    case V4L2_CID_BRIGHTNESS:
-        queryctrl.id = V4L2_CID_BRIGHTNESS;
-        ret = ioctl(dev->v4l2_fd, VIDIOC_QUERYCTRL, &queryctrl);
-        if (-1 == ret) {
-            if (errno != EINVAL)
-                printf(
-                    "V4L2: VIDIOC_QUERYCTRL"
-                    " failed: %s (%d).\n",
-                    strerror(errno), errno);
-            else
-                printf(
-                    "V4L2_CID_BRIGHTNESS is not"
-                    " supported: %s (%d).\n",
-                    strerror(errno), errno);
+    queryctrl.id = ctrl_v4l2;
+    if (ioctl(v4l2_dev.fd, VIDIOC_QUERYCTRL, &queryctrl) == -1) {
+        if (errno != EINVAL) {
+            printf("%s: %s VIDIOC_QUERYCTRL failed: %s (%d).\n",
+                uvc_dev.device_type_name, ctrl.v4l2_name, strerror(errno), errno);
 
-            return ret;
-        } else if (queryctrl.flags & V4L2_CTRL_FLAG_DISABLED) {
-            printf("V4L2_CID_BRIGHTNESS is not supported.\n");
-            ret = -EINVAL;
-            return ret;
         } else {
-            CLEAR(control);
-            control.id = V4L2_CID_BRIGHTNESS;
-            control.value = new_val;
+            printf("%s: %s is not supported: %s (%d).\n",
+                uvc_dev.device_type_name, ctrl.v4l2_name, strerror(errno), errno);
 
-            ret = ioctl(dev->v4l2_fd, VIDIOC_S_CTRL, &control);
-            if (-1 == ret) {
-                printf("V4L2: VIDIOC_S_CTRL failed: %s (%d).\n", strerror(errno), errno);
-                return ret;
+        }
+
+    } else if (queryctrl.flags & V4L2_CTRL_FLAG_DISABLED) {
+        printf("%s: %s is disabled.\n", uvc_dev.device_type_name, ctrl.v4l2_name);
+
+    } else {
+        CLEAR(control);
+        control.id = ctrl.v4l2;
+        control.value = v4l2_ctrl_value;
+
+        if (ioctl(v4l2_dev.fd, VIDIOC_S_CTRL, &control) == -1) {
+            printf("%s: %s VIDIOC_S_CTRL failed: %s (%d).\n",
+                uvc_dev.device_type_name, ctrl.v4l2_name, strerror(errno), errno);
+            return;
+        }
+        printf("%s: %s changed value (V4L2: %d, UVC: %d)\n",
+            uvc_dev.device_type_name, ctrl.v4l2_name, v4l2_ctrl_value, ctrl.value);
+    }
+}
+
+static void v4l2_set_ctrl(struct control_mapping_pair ctrl)
+{
+    int v4l2_ctrl_value = 0;
+    int v4l2_diff = ctrl.v4l2_maximum - ctrl.v4l2_minimum;
+    int ctrl_diff = ctrl.maximum - ctrl.minimum;
+
+    if (ctrl.value < ctrl.minimum) {
+        ctrl.value = ctrl.minimum;
+    }
+
+    if (ctrl.value > ctrl.maximum) {
+        ctrl.value = ctrl.maximum;
+    }
+
+    v4l2_ctrl_value = (ctrl.value - ctrl.minimum) * v4l2_diff / ctrl_diff + ctrl.v4l2_minimum;
+
+    v4l2_set_ctrl_value(ctrl, ctrl.v4l2, v4l2_ctrl_value);
+
+    if (ctrl.v4l2 == V4L2_CID_RED_BALANCE) {
+        v4l2_set_ctrl_value(ctrl, V4L2_CID_BLUE_BALANCE, v4l2_ctrl_value);
+    }
+}
+
+static void v4l2_apply_camera_control(struct control_mapping_pair * mapping,
+    struct v4l2_queryctrl queryctrl, struct v4l2_control control)
+{
+    mapping->enabled       = true;
+    mapping->control_type  = queryctrl.type;
+    mapping->v4l2_minimum  = queryctrl.minimum;
+    mapping->v4l2_maximum  = queryctrl.maximum;
+    mapping->minimum        = 0;
+    mapping->maximum       = (0 - queryctrl.minimum) + queryctrl.maximum;
+    mapping->step          = queryctrl.step;
+    mapping->default_value = (0 - queryctrl.minimum) + queryctrl.default_value;
+    mapping->value         = (0 - queryctrl.minimum) + control.value;
+    
+    printf("V4L2: Supported control %s (%s = %s)\n", queryctrl.name,
+        mapping->v4l2_name, mapping->uvc_name);
+
+    printf("V4L2:   V4L2: min: %d, max: %d, step: %d, default: %d, value: %d\n",
+        queryctrl.minimum,
+        queryctrl.maximum,
+        queryctrl.step,
+        queryctrl.default_value,
+        control.value
+    );
+
+    printf("V4L2:   UVC: min: %d, max: %d, step: %d, default: %d, value: %d\n",
+        mapping->minimum,
+        mapping->maximum,
+        queryctrl.step,
+        mapping->default_value,
+        mapping->value
+    );
+}
+
+static void v4l2_get_controls()
+{
+    int i;
+    struct v4l2_queryctrl queryctrl;
+    struct v4l2_control control;
+    unsigned int id;
+    const unsigned next_fl = V4L2_CTRL_FLAG_NEXT_CTRL | V4L2_CTRL_FLAG_NEXT_COMPOUND;
+    CLEAR(queryctrl);
+
+    queryctrl.id = next_fl;
+    while (0 == ioctl (v4l2_dev.fd, VIDIOC_QUERYCTRL, &queryctrl)) {
+
+        id = queryctrl.id;
+        queryctrl.id |= next_fl;
+
+        if (queryctrl.flags & V4L2_CTRL_FLAG_DISABLED) {
+            continue;
+        }
+
+        for (i = 0; i < control_mapping_size; i++) {
+            if (control_mapping[i].v4l2 == id) {
+                control.id = queryctrl.id;
+                if (0 == ioctl (v4l2_dev.fd, VIDIOC_G_CTRL, &control)) {
+                    v4l2_apply_camera_control(&control_mapping[i], queryctrl, control);
+                }
             }
         }
-        printf("V4L2: Brightness control changed to value = 0x%x\n", new_val);
-        break;
-
-    default:
-        /* TODO: We don't support any other controls. */
-        return -EINVAL;
     }
-
-    return 0;
 }
 
-static int v4l2_start_capturing(struct v4l2_device *dev)
+static void v4l2_close()
 {
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    int ret;
-
-    ret = ioctl(dev->v4l2_fd, VIDIOC_STREAMON, &type);
-    if (ret < 0) {
-        printf("V4L2: Unable to start streaming: %s (%d).\n", strerror(errno), errno);
-        return ret;
+    if (v4l2_dev.fd) {
+        close(v4l2_dev.fd);
+        v4l2_dev.fd = -1;
     }
-
-    printf("V4L2: Starting video stream.\n");
-
-    return 0;
 }
 
-static int v4l2_stop_capturing(struct v4l2_device *dev)
+static void uvc_close()
 {
-    enum v4l2_buf_type type;
-    int ret;
-
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
-        ret = ioctl(dev->v4l2_fd, VIDIOC_STREAMOFF, &type);
-        if (ret < 0) {
-            printf("V4L2: VIDIOC_STREAMOFF failed: %s (%d).\n", strerror(errno), errno);
-            return ret;
-        }
-
-        break;
-    default:
-        /* Nothing to do. */
-        break;
+    if (uvc_dev.fd) {
+        close(uvc_dev.fd);
+        uvc_dev.fd = -1;
     }
-
-    return 0;
-}
-static int v4l2_open(struct v4l2_device **v4l2, char *devname, struct v4l2_format *s_fmt)
-{
-    struct v4l2_device *dev;
-    struct v4l2_capability cap;
-    int fd;
-    int ret = -EINVAL;
-
-    fd = open(devname, O_RDWR | O_NONBLOCK, 0);
-    if (fd == -1) {
-        printf("V4L2: device open failed: %s (%d).\n", strerror(errno), errno);
-        return ret;
-    }
-
-    ret = ioctl(fd, VIDIOC_QUERYCAP, &cap);
-    if (ret < 0) {
-        printf("V4L2: VIDIOC_QUERYCAP failed: %s (%d).\n", strerror(errno), errno);
-        goto err;
-    }
-
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-        printf("V4L2: %s is no video capture device\n", devname);
-        goto err;
-    }
-
-    if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-        printf("V4L2: %s does not support streaming i/o\n", devname);
-        goto err;
-    }
-
-    dev = calloc(1, sizeof *dev);
-    if (dev == NULL) {
-        ret = -ENOMEM;
-        goto err;
-    }
-
-    printf("V4L2 device is %s on bus %s\n", cap.card, cap.bus_info);
-
-    dev->v4l2_fd = fd;
-
-    /* Get the default image format supported. */
-    ret = v4l2_get_format(dev);
-    if (ret < 0)
-        goto err_free;
-
-    /*
-     * Set the desired image format.
-     * Note: VIDIOC_S_FMT may change width and height.
-     */
-    ret = v4l2_set_format(dev, s_fmt);
-    if (ret < 0)
-        goto err_free;
-
-    /* Get the changed image format. */
-    ret = v4l2_get_format(dev);
-    if (ret < 0)
-        goto err_free;
-
-    printf("v4l2 open succeeded, file descriptor = %d\n", fd);
-
-    *v4l2 = dev;
-
-    return 0;
-
-err_free:
-    free(dev);
-err:
-    close(fd);
-
-    return ret;
 }
 
-static void v4l2_close(struct v4l2_device *dev)
+static void fb_close()
 {
-    close(dev->v4l2_fd);
-    free(dev);
+    if (fb_dev.fd) {
+        close(fb_dev.fd);
+        fb_dev.fd = -1;
+    }
 }
 
-/* ---------------------------------------------------------------------------
- * UVC generic stuff
- */
-
-__attribute__((unused))
-static int uvc_video_set_format(struct uvc_device *dev)
+// https://stackoverflow.com/a/15683117
+static void v4l2_get_available_formats()
 {
-    struct v4l2_format fmt;
-    int ret;
+    struct v4l2_fmtdesc fmtdesc;
+    struct v4l2_frmsizeenum frmsize;
+    unsigned int width;
+    unsigned int height;
+    CLEAR(fmtdesc);
+    fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-    CLEAR(fmt);
+    while (ioctl(v4l2_dev.fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+        if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG || fmtdesc.pixelformat == V4L2_PIX_FMT_YUYV) {
+            frmsize.pixel_format = fmtdesc.pixelformat;
+            frmsize.index = 0;
+            while (ioctl(v4l2_dev.fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) >= 0) {
+                width = 0;
+                height = 0;
+                if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+                    width = frmsize.discrete.width;
+                    height = frmsize.discrete.height;
 
-    fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    fmt.fmt.pix.width = dev->width;
-    fmt.fmt.pix.height = dev->height;
-    fmt.fmt.pix.pixelformat = dev->fcc;
-    fmt.fmt.pix.field = V4L2_FIELD_NONE;
-    if (dev->fcc == V4L2_PIX_FMT_MJPEG)
-        fmt.fmt.pix.sizeimage = dev->imgsize * 1.5;
+                } else if (frmsize.type == V4L2_FRMSIZE_TYPE_STEPWISE) {
+                    width = frmsize.stepwise.max_width;
+                    height = frmsize.stepwise.max_height;
 
-    ret = ioctl(dev->uvc_fd, VIDIOC_S_FMT, &fmt);
-    if (ret < 0) {
-        printf("UVC: Unable to set format %s (%d).\n", strerror(errno), errno);
-        return ret;
-    }
+                }
 
-    printf("UVC: Setting format to: %c%c%c%c %ux%u\n", pixfmtstr(dev->fcc), dev->width, dev->height);
-
-    return 0;
-}
-
-static int uvc_video_stream(struct uvc_device *dev, int enable)
-{
-    int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    int ret;
-
-    if (!enable) {
-        ret = ioctl(dev->uvc_fd, VIDIOC_STREAMOFF, &type);
-        if (ret < 0) {
-            printf("UVC: VIDIOC_STREAMOFF failed: %s (%d).\n", strerror(errno), errno);
-            return ret;
-        }
-
-        printf("UVC: Stopping video stream.\n");
-
-        return 0;
-    }
-
-    ret = ioctl(dev->uvc_fd, VIDIOC_STREAMON, &type);
-    if (ret < 0) {
-        printf("UVC: Unable to start streaming %s (%d).\n", strerror(errno), errno);
-        return ret;
-    }
-
-    printf("UVC: Starting video stream.\n");
-
-    dev->uvc_shutdown_requested = 0;
-
-    return 0;
-}
-
-static int uvc_uninit_device(struct uvc_device *dev)
-{
-    unsigned int i;
-    int ret;
-
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        for (i = 0; i < dev->nbufs; ++i) {
-            ret = munmap(dev->mem[i].start, dev->mem[i].length);
-            if (ret < 0) {
-                printf("UVC: munmap failed\n");
-                return ret;
+                if (width && height) {
+                    printf("%s: Getting highest frame size: %c%c%c%c %ux%u\n",
+                        v4l2_dev.device_type_name, pixfmtstr(fmtdesc.pixelformat), width, height);
+                }
+                frmsize.index++;
             }
         }
-
-        free(dev->mem);
-        break;
-
-    case IO_METHOD_USERPTR:
-    default:
-        if (dev->run_standalone) {
-            for (i = 0; i < dev->nbufs; ++i)
-                free(dev->dummy_buf[i].start);
-
-            free(dev->dummy_buf);
-        }
-        break;
+        fmtdesc.index++;
     }
-
-    return 0;
-}
-static int uvc_open(struct uvc_device **uvc, char *devname)
-{
-    struct uvc_device *dev;
-    struct v4l2_capability cap;
-    int fd;
-    int ret = -EINVAL;
-
-    fd = open(devname, O_RDWR | O_NONBLOCK);
-    if (fd == -1) {
-        printf("UVC: device open failed: %s (%d).\n", strerror(errno), errno);
-        return ret;
-    }
-
-    ret = ioctl(fd, VIDIOC_QUERYCAP, &cap);
-    if (ret < 0) {
-        printf("UVC: unable to query uvc device: %s (%d)\n", strerror(errno), errno);
-        goto err;
-    }
-
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_OUTPUT)) {
-        printf("UVC: %s is no video output device\n", devname);
-        goto err;
-    }
-
-    dev = calloc(1, sizeof *dev);
-    if (dev == NULL) {
-        ret = -ENOMEM;
-        goto err;
-    }
-
-    printf("uvc device is %s on bus %s\n", cap.card, cap.bus_info);
-    printf("uvc open succeeded, file descriptor = %d\n", fd);
-
-    dev->uvc_fd = fd;
-    *uvc = dev;
-
-    return 0;
-
-err:
-    close(fd);
-    return ret;
-}
-
-static void uvc_close(struct uvc_device *dev)
-{
-    close(dev->uvc_fd);
-    free(dev->imgdata);
-    free(dev);
 }
 
 /* ---------------------------------------------------------------------------
  * UVC streaming related
  */
 
-static void uvc_video_fill_buffer(struct uvc_device *dev, struct v4l2_buffer *buf)
+static void uvc_fb_fill_buffer(struct v4l2_buffer * buf)
 {
-    unsigned int bpl;
-    unsigned int i;
+    unsigned int rgba1;
+    unsigned int rgba2;
+    unsigned int rgba1_last;
+    unsigned int rgba2_last;
+    unsigned int yvyu;
+    unsigned int yvyu_last;
+    unsigned char r1;
+    unsigned char b1;
+    unsigned char g1;
+    unsigned char r2;
+    unsigned char b2;
+    unsigned char g2;
+    unsigned int size = fb_dev.fb_height * fb_dev.fb_width;
+    char * uvc_pixels = (char *) uvc_dev.mem[buf->index].start;
+    char * fb_pixels  = (char *) fb_dev.fb_memory;
 
-    switch (dev->fcc) {
-    case V4L2_PIX_FMT_YUYV:
-        /* Fill the buffer with video data. */
-        bpl = dev->width * 2;
-        for (i = 0; i < dev->height; ++i)
-            memset(dev->mem[buf->index].start + i * bpl, dev->color++, bpl);
+    buf->bytesused = size * 2;
 
-        buf->bytesused = bpl * dev->height;
-        break;
+    switch(fb_dev.fb_bpp) {
+        case 16:
+            while(size) {
+                b1 = (*(fb_pixels) & 0x1f) << 3;
+                g1 = (((*(fb_pixels + 1) & 0x7) << 3) | (*(fb_pixels) & 0xE0) >> 5) << 2;
+                r1 = (*(fb_pixels + 1) & 0xF8);
+                b2 = (*(fb_pixels + 2) & 0x1f) << 3;
+                g2 = (((*(fb_pixels + 3) & 0x7) << 3) | (*(fb_pixels + 2) & 0xE0) >> 5) << 2;
+                r2 = (*(fb_pixels + 3) & 0xF8);
+                yvyu = rgb2yvyu(r1, g1, b1, r2, g2, b2);
+                memcpy(uvc_pixels, &yvyu, 4);
+                fb_pixels += 4;
+                uvc_pixels += 4;
+                size -= 2;
+            }
+            break;
 
-    case V4L2_PIX_FMT_MJPEG:
-        memcpy(dev->mem[buf->index].start, dev->imgdata, dev->imgsize);
-        buf->bytesused = dev->imgsize;
-        break;
+        case 24:
+            while(size) {
+                memcpy(&rgba1, fb_pixels, 3);
+                memcpy(&rgba2, fb_pixels + 3, 3);
+                if (rgba1 == rgba1_last && rgba2 == rgba2_last) {
+                    memcpy(uvc_pixels, &yvyu_last, 4);
+                } else {
+                    r1 = rgba1 & 0xFF;
+                    g1 = (rgba1 >> 8) & 0xFF;
+                    b1 = (rgba1 >> 16) & 0xFF;
+                    r2 = rgba2 & 0xFF;
+                    g2 = (rgba2 >> 8) & 0xFF;
+                    b2 = (rgba2 >> 16) & 0xFF;
+                    yvyu = rgb2yvyu(r1, g1, b1, r2, g2, b2);
+                    rgba1_last = rgba1;
+                    rgba2_last = rgba2;
+                    yvyu_last = yvyu;
+                    memcpy(uvc_pixels, &yvyu, 4);
+                }
+                fb_pixels += 6;
+                uvc_pixels += 4;
+                size -= 2;
+            }
+            break;
+
+        case 32:
+            while(size) {
+                memcpy(&rgba1, fb_pixels, 4);
+                memcpy(&rgba2, fb_pixels + 4, 4);
+                if (rgba1 == rgba1_last && rgba2 == rgba2_last) {
+                    memcpy(uvc_pixels, &yvyu_last, 4);
+                } else {
+                    r1 = rgba1 & 0xFF;
+                    g1 = (rgba1 >> 8) & 0xFF;
+                    b1 = (rgba1 >> 16) & 0xFF;
+                    r2 = rgba2 & 0xFF;
+                    g2 = (rgba2 >> 8) & 0xFF;
+                    b2 = (rgba2 >> 16) & 0xFF;
+                    yvyu = rgb2yvyu(r1, g1, b1, r2, g2, b2);
+                    rgba1_last = rgba1;
+                    rgba2_last = rgba2;
+                    yvyu_last = yvyu;
+                    memcpy(uvc_pixels, &yvyu, 4);
+                }
+                fb_pixels += 8;
+                uvc_pixels += 4;
+                size -= 2;
+            }
+            break;
     }
-}
+ }
 
-static int uvc_video_process(struct uvc_device *dev)
+static void uvc_fb_video_process()
 {
     struct v4l2_buffer ubuf;
-    struct v4l2_buffer vbuf;
-    unsigned int i;
-    int ret;
     /*
      * Return immediately if UVC video output device has not started
      * streaming yet.
      */
-    if (!dev->is_streaming)
-        return 0;
+    if (!uvc_dev.is_streaming) {
+        return;
+    }
     /* Prepare a v4l2 buffer to be dequeued from UVC domain. */
     CLEAR(ubuf);
+    ubuf.type   = uvc_dev.buffer_type;
+    ubuf.memory = uvc_dev.memory_type;
 
-    ubuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        ubuf.memory = V4L2_MEMORY_MMAP;
-        break;
-
-    case IO_METHOD_USERPTR:
-    default:
-        ubuf.memory = V4L2_MEMORY_USERPTR;
-        break;
-    }
-    if (dev->run_standalone) {
-        /* UVC stanalone setup. */
-        ret = ioctl(dev->uvc_fd, VIDIOC_DQBUF, &ubuf);
-        if (ret < 0)
-            return ret;
-
-        dev->dqbuf_count++;
-#ifdef ENABLE_BUFFER_DEBUG
-        printf("DeQueued buffer at UVC side = %d\n", ubuf.index);
-#endif
-        uvc_video_fill_buffer(dev, &ubuf);
-
-        ret = ioctl(dev->uvc_fd, VIDIOC_QBUF, &ubuf);
-        if (ret < 0)
-            return ret;
-
-        dev->qbuf_count++;
-
-#ifdef ENABLE_BUFFER_DEBUG
-        printf("ReQueueing buffer at UVC side = %d\n", ubuf.index);
-#endif
-    } else {
-        /* UVC - V4L2 integrated path. */
-
-        /*
-         * Return immediately if V4L2 video capture device has not
-         * started streaming yet or if QBUF was not called even once on
-         * the UVC side.
-         */
-        if (!dev->vdev->is_streaming || !dev->first_buffer_queued)
-            return 0;
-
-        /*
-         * Do not dequeue buffers from UVC side until there are atleast
-         * 2 buffers available at UVC domain.
-         */
-        if (!dev->uvc_shutdown_requested)
-            if ((dev->dqbuf_count + 1) >= dev->qbuf_count)
-                return 0;
-
-        /* Dequeue the spent buffer from UVC domain */
-        ret = ioctl(dev->uvc_fd, VIDIOC_DQBUF, &ubuf);
-        if (ret < 0) {
-            printf("UVC: Unable to dequeue buffer: %s (%d).\n", strerror(errno), errno);
-            return ret;
-        }
-
-        if (dev->io == IO_METHOD_USERPTR)
-            for (i = 0; i < dev->nbufs; ++i)
-                if (ubuf.m.userptr == (unsigned long)dev->vdev->mem[i].start && ubuf.length == dev->vdev->mem[i].length)
-                    break;
-
-        dev->dqbuf_count++;
-
-#ifdef ENABLE_BUFFER_DEBUG
-        printf("DeQueued buffer at UVC side=%d\n", ubuf.index);
-#endif
-
-        /*
-         * If the dequeued buffer was marked with state ERROR by the
-         * underlying UVC driver gadget, do not queue the same to V4l2
-         * and wait for a STREAMOFF event on UVC side corresponding to
-         * set_alt(0). So, now all buffers pending at UVC end will be
-         * dequeued one-by-one and we will enter a state where we once
-         * again wait for a set_alt(1) command from the USB host side.
-         */
-        if (ubuf.flags & V4L2_BUF_FLAG_ERROR) {
-            dev->uvc_shutdown_requested = 1;
-            printf(
-                "UVC: Possible USB shutdown requested from "
-                "Host, seen during VIDIOC_DQBUF\n");
-            return 0;
-        }
-
-        /* Queue the buffer to V4L2 domain */
-        CLEAR(vbuf);
-
-        vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        vbuf.memory = V4L2_MEMORY_MMAP;
-        vbuf.index = ubuf.index;
-
-        ret = ioctl(dev->vdev->v4l2_fd, VIDIOC_QBUF, &vbuf);
-        if (ret < 0)
-            return ret;
-
-        dev->vdev->qbuf_count++;
-
-#ifdef ENABLE_BUFFER_DEBUG
-        printf("ReQueueing buffer at V4L2 side = %d\n", vbuf.index);
-#endif
+    if (ioctl(uvc_dev.fd, VIDIOC_DQBUF, &ubuf) < 0) {
+        printf("%s: Unable to dequeue buffer: %s (%d).\n",
+            uvc_dev.device_type_name, strerror(errno), errno);
+        return;
     }
 
-    return 0;
+    uvc_fb_fill_buffer(&ubuf);
+
+    if (ioctl(uvc_dev.fd, VIDIOC_QBUF, &ubuf) < 0) {
+        printf("%s: Unable to queue buffer: %s (%d).\n",
+            uvc_dev.device_type_name, strerror(errno), errno);
+        return;
+    }
+
+    uvc_dev.qbuf_count++;
+
+    if (settings.show_fps) {
+        uvc_dev.buffers_processed++;
+    }
 }
 
-static int uvc_video_qbuf_mmap(struct uvc_device *dev)
+static void uvc_v4l2_video_process()
 {
-    unsigned int i;
-    int ret;
-
-    for (i = 0; i < dev->nbufs; ++i) {
-        memset(&dev->mem[i].buf, 0, sizeof(dev->mem[i].buf));
-
-        dev->mem[i].buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-        dev->mem[i].buf.memory = V4L2_MEMORY_MMAP;
-        dev->mem[i].buf.index = i;
-
-        /* UVC standalone setup. */
-        if (dev->run_standalone)
-            uvc_video_fill_buffer(dev, &(dev->mem[i].buf));
-
-        ret = ioctl(dev->uvc_fd, VIDIOC_QBUF, &(dev->mem[i].buf));
-        if (ret < 0) {
-            printf("UVC: VIDIOC_QBUF failed : %s (%d).\n", strerror(errno), errno);
-            return ret;
-        }
-
-        dev->qbuf_count++;
+    struct v4l2_buffer ubuf;
+    struct v4l2_buffer vbuf;
+    /*
+     * Do not dequeue buffers from UVC side until there are atleast
+     * 2 buffers available at UVC domain.
+     */
+    if (!uvc_shutdown_requested && ((uvc_dev.dqbuf_count + 1) >= uvc_dev.qbuf_count)) {
+        return;
     }
 
-    return 0;
+    /* Prepare a v4l2 buffer to be dequeued from UVC domain. */
+    CLEAR(ubuf);
+    ubuf.type   = uvc_dev.buffer_type;
+    ubuf.memory = uvc_dev.memory_type;
+
+    /* Dequeue the spent buffer from UVC domain */
+    if (ioctl(uvc_dev.fd, VIDIOC_DQBUF, &ubuf) < 0) {
+        printf("%s: Unable to dequeue buffer: %s (%d).\n",
+            uvc_dev.device_type_name, strerror(errno), errno);
+        return;
+    }
+
+    uvc_dev.dqbuf_count++;
+
+    /*
+        * If the dequeued buffer was marked with state ERROR by the
+        * underlying UVC driver gadget, do not queue the same to V4l2
+        * and wait for a STREAMOFF event on UVC side corresponding to
+        * set_alt(0). So, now all buffers pending at UVC end will be
+        * dequeued one-by-one and we will enter a state where we once
+        * again wait for a set_alt(1) command from the USB host side.
+        */
+    if (ubuf.flags & V4L2_BUF_FLAG_ERROR) {
+        uvc_shutdown_requested = true;
+        printf("UVC: Possible USB shutdown requested from Host, seen during VIDIOC_DQBUF\n");
+        return;
+    }
+
+    /* Queue the buffer to V4L2 domain */
+    CLEAR(vbuf);
+    vbuf.type   = v4l2_dev.buffer_type;
+    vbuf.memory = v4l2_dev.memory_type;
+    vbuf.index  = ubuf.index;
+
+    if (ioctl(v4l2_dev.fd, VIDIOC_QBUF, &vbuf) < 0) {
+        printf("%s: Unable to queue buffer: %s (%d).\n",
+            v4l2_dev.device_type_name, strerror(errno), errno);
+        return;
+    }
+
+    v4l2_dev.qbuf_count++;
+
+    if (settings.show_fps) {
+        uvc_dev.buffers_processed++;
+    }
 }
 
-static int uvc_video_qbuf_userptr(struct uvc_device *dev)
+static void uvc_handle_streamon_event()
 {
-    unsigned int i;
-    int ret;
-
-    /* UVC standalone setup. */
-    if (dev->run_standalone) {
-        for (i = 0; i < dev->nbufs; ++i) {
-            struct v4l2_buffer buf;
-
-            CLEAR(buf);
-            buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-            buf.memory = V4L2_MEMORY_USERPTR;
-            buf.m.userptr = (unsigned long)dev->dummy_buf[i].start;
-            buf.length = dev->dummy_buf[i].length;
-            buf.index = i;
-
-            ret = ioctl(dev->uvc_fd, VIDIOC_QBUF, &buf);
-            if (ret < 0) {
-                printf("UVC: VIDIOC_QBUF failed : %s (%d).\n", strerror(errno), errno);
-                return ret;
-            }
-
-            dev->qbuf_count++;
-        }
-    }
-
-    return 0;
-}
-
-static int uvc_video_qbuf(struct uvc_device *dev)
-{
-    int ret = 0;
-
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        ret = uvc_video_qbuf_mmap(dev);
-        break;
-
-    case IO_METHOD_USERPTR:
-        ret = uvc_video_qbuf_userptr(dev);
-        break;
-
-    default:
-        ret = -EINVAL;
-        break;
-    }
-
-    return ret;
-}
-
-static int uvc_video_reqbufs_mmap(struct uvc_device *dev, int nbufs)
-{
-    struct v4l2_requestbuffers rb;
-    unsigned int i;
-    int ret;
-
-    CLEAR(rb);
-
-    rb.count = nbufs;
-    rb.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    rb.memory = V4L2_MEMORY_MMAP;
-
-    ret = ioctl(dev->uvc_fd, VIDIOC_REQBUFS, &rb);
-    if (ret < 0) {
-        if (ret == -EINVAL)
-            printf("UVC: does not support memory mapping\n");
-        else
-            printf("UVC: Unable to allocate buffers: %s (%d).\n", strerror(errno), errno);
-        goto err;
-    }
-
-    if (!rb.count)
-        return 0;
-
-    if (rb.count < 2) {
-        printf("UVC: Insufficient buffer memory.\n");
-        ret = -EINVAL;
-        goto err;
-    }
-
-    /* Map the buffers. */
-    dev->mem = calloc(rb.count, sizeof dev->mem[0]);
-    if (!dev->mem) {
-        printf("UVC: Out of memory\n");
-        ret = -ENOMEM;
-        goto err;
-    }
-
-    for (i = 0; i < rb.count; ++i) {
-        memset(&dev->mem[i].buf, 0, sizeof(dev->mem[i].buf));
-
-        dev->mem[i].buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-        dev->mem[i].buf.memory = V4L2_MEMORY_MMAP;
-        dev->mem[i].buf.index = i;
-
-        ret = ioctl(dev->uvc_fd, VIDIOC_QUERYBUF, &(dev->mem[i].buf));
-        if (ret < 0) {
-            printf(
-                "UVC: VIDIOC_QUERYBUF failed for buf %d: "
-                "%s (%d).\n",
-                i, strerror(errno), errno);
-            ret = -EINVAL;
-            goto err_free;
-        }
-        dev->mem[i].start =
-            mmap(NULL /* start anywhere */, dev->mem[i].buf.length, PROT_READ | PROT_WRITE /* required */,
-                 MAP_SHARED /* recommended */, dev->uvc_fd, dev->mem[i].buf.m.offset);
-
-        if (MAP_FAILED == dev->mem[i].start) {
-            printf("UVC: Unable to map buffer %u: %s (%d).\n", i, strerror(errno), errno);
-            dev->mem[i].length = 0;
-            ret = -EINVAL;
-            goto err_free;
+    if (settings.source_device == DEVICE_TYPE_V4L2) {
+        if (v4l2_request_bufs(v4l2_dev.nbufs) < 0) {
+            return;
         }
 
-        dev->mem[i].length = dev->mem[i].buf.length;
-        printf("UVC: Buffer %u mapped at address %p.\n", i, dev->mem[i].start);
-    }
-
-    dev->nbufs = rb.count;
-    printf("UVC: %u buffers allocated.\n", rb.count);
-
-    return 0;
-
-err_free:
-    free(dev->mem);
-err:
-    return ret;
-}
-
-static int uvc_video_reqbufs_userptr(struct uvc_device *dev, int nbufs)
-{
-    struct v4l2_requestbuffers rb;
-    unsigned int i, j, bpl, payload_size;
-    int ret;
-
-    CLEAR(rb);
-
-    rb.count = nbufs;
-    rb.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    rb.memory = V4L2_MEMORY_USERPTR;
-
-    ret = ioctl(dev->uvc_fd, VIDIOC_REQBUFS, &rb);
-    if (ret < 0) {
-        if (ret == -EINVAL)
-            printf("UVC: does not support user pointer i/o\n");
-        else
-            printf("UVC: VIDIOC_REQBUFS error %s (%d).\n", strerror(errno), errno);
-        goto err;
-    }
-
-    if (!rb.count)
-        return 0;
-
-    dev->nbufs = rb.count;
-    printf("UVC: %u buffers allocated.\n", rb.count);
-
-    if (dev->run_standalone) {
-        /* Allocate buffers to hold dummy data pattern. */
-        dev->dummy_buf = calloc(rb.count, sizeof dev->dummy_buf[0]);
-        if (!dev->dummy_buf) {
-            printf("UVC: Out of memory\n");
-            ret = -ENOMEM;
-            goto err;
+        if (v4l2_qbuf_mmap(&v4l2_dev) < 0) {
+            return;
         }
-
-        switch (dev->fcc) {
-        case V4L2_PIX_FMT_YUYV:
-            bpl = dev->width * 2;
-            payload_size = dev->width * dev->height * 2;
-            break;
-        case V4L2_PIX_FMT_MJPEG:
-            payload_size = dev->imgsize;
-            break;
-        }
-
-        for (i = 0; i < rb.count; ++i) {
-            dev->dummy_buf[i].length = payload_size;
-            dev->dummy_buf[i].start = malloc(payload_size);
-            if (!dev->dummy_buf[i].start) {
-                printf("UVC: Out of memory\n");
-                ret = -ENOMEM;
-                goto err;
-            }
-
-            if (V4L2_PIX_FMT_YUYV == dev->fcc)
-                for (j = 0; j < dev->height; ++j)
-                    memset(dev->dummy_buf[i].start + j * bpl, dev->color++, bpl);
-
-            if (V4L2_PIX_FMT_MJPEG == dev->fcc)
-                memcpy(dev->dummy_buf[i].start, dev->imgdata, dev->imgsize);
-        }
-
-        dev->mem = dev->dummy_buf;
-    }
-
-    return 0;
-
-err:
-    return ret;
-}
-
-static int uvc_video_reqbufs(struct uvc_device *dev, int nbufs)
-{
-    int ret = 0;
-
-    switch (dev->io) {
-    case IO_METHOD_MMAP:
-        ret = uvc_video_reqbufs_mmap(dev, nbufs);
-        break;
-
-    case IO_METHOD_USERPTR:
-        ret = uvc_video_reqbufs_userptr(dev, nbufs);
-        break;
-
-    default:
-        ret = -EINVAL;
-        break;
-    }
-
-    return ret;
-}
-
-/*
- * This function is called in response to either:
- * 	- A SET_ALT(interface 1, alt setting 1) command from USB host,
- * 	  if the UVC gadget supports an ISOCHRONOUS video streaming endpoint
- * 	  or,
- *
- *	- A UVC_VS_COMMIT_CONTROL command from USB host, if the UVC gadget
- *	  supports a BULK type video streaming endpoint.
- */
-static int uvc_handle_streamon_event(struct uvc_device *dev)
-{
-    int ret;
-
-    ret = uvc_video_reqbufs(dev, dev->nbufs);
-    if (ret < 0)
-        goto err;
-
-    if (!dev->run_standalone) {
-        /* UVC - V4L2 integrated path. */
-        if (IO_METHOD_USERPTR == dev->vdev->io) {
-            /*
-             * Ensure that the V4L2 video capture device has already
-             * some buffers queued.
-             */
-            ret = v4l2_reqbufs(dev->vdev, dev->vdev->nbufs);
-            if (ret < 0)
-                goto err;
-        }
-
-        ret = v4l2_qbuf(dev->vdev);
-        if (ret < 0)
-            goto err;
 
         /* Start V4L2 capturing now. */
-        ret = v4l2_start_capturing(dev->vdev);
-        if (ret < 0)
-            goto err;
-
-        dev->vdev->is_streaming = 1;
+        v4l2_video_stream(STREAM_ON);
     }
 
-    /* Common setup. */
-
-    /* Queue buffers to UVC domain and start streaming. */
-    ret = uvc_video_qbuf(dev);
-    if (ret < 0)
-        goto err;
-
-    if (dev->run_standalone) {
-        uvc_video_stream(dev, 1);
-        dev->first_buffer_queued = 1;
-        dev->is_streaming = 1;
+    if (uvc_request_bufs(uvc_dev.nbufs) < 0) {
+        return;
     }
 
-    return 0;
+    if (settings.source_device == DEVICE_TYPE_FRAMEBUFFER) {
+        if (fb_mmap_open() < 0) {
+            return;
+        }
 
-err:
-    return ret;
+        if (uvc_video_qbuf() < 0) {
+            return;
+        }
+
+        uvc_video_stream(STREAM_ON);
+        settings.blink_on_startup = 0;
+        streaming_status_value(uvc_dev.is_streaming);
+    }
+}
+
+static void uvc_handle_streamoff_event()
+{
+    if (settings.source_device == DEVICE_TYPE_V4L2) {
+        v4l2_video_stream(STREAM_OFF);
+        v4l2_uninit_device();
+        v4l2_request_bufs(0);
+    }
+
+    if (settings.source_device == DEVICE_TYPE_FRAMEBUFFER) {
+        fb_mmap_close();
+        uvc_uninit_device();
+    }
+
+    uvc_video_stream(STREAM_OFF);
+    uvc_request_bufs(0);
+
+    streaming_status_value(uvc_dev.is_streaming);
 }
 
 /* ---------------------------------------------------------------------------
  * UVC Request processing
  */
-
-static void
-uvc_fill_streaming_control(struct uvc_device *dev, struct uvc_streaming_control *ctrl, int iframe, int iformat)
+static void dump_uvc_streaming_control(struct uvc_streaming_control * ctrl)
 {
-    const struct uvc_format_info *format;
-    const struct uvc_frame_info *frame;
-    unsigned int nframes;
+    printf("DUMP: uvc_streaming_control: format: %d, frame: %d, frame interval: %d\n",
+        ctrl->bFormatIndex,
+        ctrl->bFrameIndex,
+        ctrl->dwFrameInterval
+    );
+}
 
-    if (iformat < 0)
-        iformat = ARRAY_SIZE(uvc_formats) + iformat;
-    if (iformat < 0 || iformat >= (int)ARRAY_SIZE(uvc_formats))
-        return;
-    format = &uvc_formats[iformat];
+static int uvc_get_frame_format_index(int format_index, enum uvc_frame_format_getter getter)
+{
+    int index = -1;
+    int value;
+    int i;
 
-    nframes = 0;
-    while (format->frames[nframes].width != 0)
-        ++nframes;
+    for (i = 0; i <= last_format_index; i++) {
+        if (format_index == -1 || format_index == (int) uvc_frame_format[i].bFormatIndex) {
 
-    if (iframe < 0)
-        iframe = nframes + iframe;
-    if (iframe < 0 || iframe >= (int)nframes)
-        return;
-    frame = &format->frames[iframe];
+            switch (getter) {
+                case FORMAT_INDEX_MIN:
+                case FORMAT_INDEX_MAX:
+                    value = uvc_frame_format[i].bFormatIndex;
+                    break;
 
-    memset(ctrl, 0, sizeof *ctrl);
+                case FRAME_INDEX_MIN:
+                case FRAME_INDEX_MAX:
+                    value = uvc_frame_format[i].bFrameIndex;
+                    break;
+            }
+            if (index == -1) {
+                index = value;
 
-    ctrl->bmHint = 1;
-    ctrl->bFormatIndex = iformat + 1;
-    ctrl->bFrameIndex = iframe + 1;
-    ctrl->dwFrameInterval = frame->intervals[0];
-    switch (format->fcc) {
-    case V4L2_PIX_FMT_YUYV:
-        ctrl->dwMaxVideoFrameSize = frame->width * frame->height * 2;
+            } else {
+                switch (getter) {
+                    case FORMAT_INDEX_MIN:
+                    case FRAME_INDEX_MIN:
+                        if (value < index) {
+                            index = value;
+                        }
+                        break;
+
+                    case FORMAT_INDEX_MAX:
+                    case FRAME_INDEX_MAX:
+                        if (value > index) {
+                            index = value;
+                        }
+                        break;
+                }
+            }
+        }
+    }
+    return index;
+}
+
+static int uvc_get_frame_format(struct uvc_frame_format ** frame_format,
+    unsigned int iFormat, unsigned int iFrame)
+{
+    int i;
+    for (i = 0; i <= last_format_index; i++) {
+        if (uvc_frame_format[i].bFormatIndex == iFormat &&
+            uvc_frame_format[i].bFrameIndex == iFrame
+        ) {
+            *frame_format = &uvc_frame_format[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void uvc_dump_frame_format(struct uvc_frame_format * frame_format, const char * title)
+{
+    printf("%s: format: %d, frame: %d, resolution: %dx%d, frame_interval: %d,  bitrate: [%d, %d]\n",
+        title,
+        frame_format->bFormatIndex,
+        frame_format->bFrameIndex,
+        frame_format->wWidth,
+        frame_format->wHeight,
+        frame_format->dwDefaultFrameInterval,
+        frame_format->dwMinBitRate,
+        frame_format->dwMaxBitRate
+    );
+}
+
+static void uvc_fill_streaming_control(struct uvc_streaming_control * ctrl,
+    enum stream_control_action action, int iformat, int iframe)
+{
+    int format_first;
+    int format_last;
+    int frame_first;
+    int frame_last;
+    int format_frame_first;
+    int format_frame_last;
+    unsigned int frame_interval;
+    unsigned int dwMaxPayloadTransferSize;
+
+    switch (action) {
+    case STREAM_CONTROL_INIT:
+        printf("UVC: Streaming control: action: INIT\n");
         break;
-    case V4L2_PIX_FMT_MJPEG:
-        ctrl->dwMaxVideoFrameSize = dev->imgsize;
+
+    case STREAM_CONTROL_MIN:
+        printf("UVC: Streaming control: action: GET MIN\n");
         break;
+
+    case STREAM_CONTROL_MAX:
+        printf("UVC: Streaming control: action: GET MAX\n");
+        break;
+
+    case STREAM_CONTROL_SET:
+        printf("UVC: Streaming control: action: SET, format: %d, frame: %d\n", iformat, iframe);
+        break;
+
     }
 
-    /* TODO: the UVC maxpayload transfer size should be filled
-     * by the driver.
-     */
-    if (!dev->bulk)
-        ctrl->dwMaxPayloadTransferSize = (dev->maxpkt) * (dev->mult + 1) * (dev->burst + 1);
-    else
-        ctrl->dwMaxPayloadTransferSize = ctrl->dwMaxVideoFrameSize;
+    format_first = uvc_get_frame_format_index(-1, FORMAT_INDEX_MIN);
+    format_last = uvc_get_frame_format_index(-1, FORMAT_INDEX_MAX);
 
-    ctrl->bmFramingInfo = 3;
-    ctrl->bPreferedVersion = 1;
-    ctrl->bMaxVersion = 1;
-}
+    frame_first = uvc_get_frame_format_index(-1, FRAME_INDEX_MIN);
+    frame_last = uvc_get_frame_format_index(-1, FRAME_INDEX_MAX);
 
-static void
-uvc_events_process_standard(struct uvc_device *dev, struct usb_ctrlrequest *ctrl, struct uvc_request_data *resp)
-{
-    printf("standard request\n");
-    (void)dev;
-    (void)ctrl;
-    (void)resp;
-}
+    if (action == STREAM_CONTROL_MIN) {
+        iformat = format_first;
+        iframe = frame_first;
 
-static void uvc_events_process_control(
-    struct uvc_device *dev, uint8_t req, uint8_t cs, uint8_t entity_id, uint8_t len, struct uvc_request_data *resp)
-{
-    switch (entity_id) {
-    case 0:
-        switch (cs) {
-        case UVC_VC_REQUEST_ERROR_CODE_CONTROL:
-            /* Send the request error code last prepared. */
-            resp->data[0] = dev->request_error_code.data[0];
-            resp->length = dev->request_error_code.length;
-            break;
+    } else if (action == STREAM_CONTROL_MAX) {
+        iformat = format_last;
+        iframe = frame_last;
 
-        default:
-            /*
-             * If we were not supposed to handle this
-             * 'cs', prepare an error code response.
-             */
-            dev->request_error_code.data[0] = 0x06;
-            dev->request_error_code.length = 1;
-            break;
-        }
-        break;
+    } else {
+        iformat = clamp(iformat, format_first, format_last);
 
-    /* Camera terminal unit 'UVC_VC_INPUT_TERMINAL'. */
-    case 1:
-        switch (cs) {
-        /*
-         * We support only 'UVC_CT_AE_MODE_CONTROL' for CAMERA
-         * terminal, as our bmControls[0] = 2 for CT. Also we
-         * support only auto exposure.
-         */
-        case UVC_CT_AE_MODE_CONTROL:
-            switch (req) {
-            case UVC_SET_CUR:
-                /* Incase of auto exposure, attempts to
-                 * programmatically set the auto-adjusted
-                 * controls are ignored.
-                 */
-                resp->data[0] = 0x01;
-                resp->length = 1;
-                /*
-                 * For every successfully handled control
-                 * request set the request error code to no
-                 * error.
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
+        format_frame_first = uvc_get_frame_format_index(iformat, FRAME_INDEX_MIN);
+        format_frame_last = uvc_get_frame_format_index(iformat, FRAME_INDEX_MAX);
 
-            case UVC_GET_INFO:
-                /*
-                 * TODO: We support Set and Get requests, but
-                 * don't support async updates on an video
-                 * status (interrupt) endpoint as of
-                 * now.
-                 */
-                resp->data[0] = 0x03;
-                resp->length = 1;
-                /*
-                 * For every successfully handled control
-                 * request set the request error code to no
-                 * error.
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-
-            case UVC_GET_CUR:
-            case UVC_GET_DEF:
-            case UVC_GET_RES:
-                /* Auto Mode â€“ auto Exposure Time, auto Iris. */
-                resp->data[0] = 0x02;
-                resp->length = 1;
-                /*
-                 * For every successfully handled control
-                 * request set the request error code to no
-                 * error.
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-            default:
-                /*
-                 * We don't support this control, so STALL the
-                 * control ep.
-                 */
-                resp->length = -EL2HLT;
-                /*
-                 * For every unsupported control request
-                 * set the request error code to appropriate
-                 * value.
-                 */
-                dev->request_error_code.data[0] = 0x07;
-                dev->request_error_code.length = 1;
-                break;
-            }
-            break;
-
-        default:
-            /*
-             * We don't support this control, so STALL the control
-             * ep.
-             */
-            resp->length = -EL2HLT;
-            /*
-             * If we were not supposed to handle this
-             * 'cs', prepare a Request Error Code response.
-             */
-            dev->request_error_code.data[0] = 0x06;
-            dev->request_error_code.length = 1;
-            break;
-        }
-        break;
-
-    /* processing unit 'UVC_VC_PROCESSING_UNIT' */
-    case 2:
-        switch (cs) {
-        /*
-         * We support only 'UVC_PU_BRIGHTNESS_CONTROL' for Processing
-         * Unit, as our bmControls[0] = 1 for PU.
-         */
-        case UVC_PU_BRIGHTNESS_CONTROL:
-            switch (req) {
-            case UVC_SET_CUR:
-                resp->data[0] = 0x0;
-                resp->length = len;
-                /*
-                 * For every successfully handled control
-                 * request set the request error code to no
-                 * error
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-            case UVC_GET_MIN:
-                resp->data[0] = PU_BRIGHTNESS_MIN_VAL;
-                resp->length = 2;
-                /*
-                 * For every successfully handled control
-                 * request set the request error code to no
-                 * error
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-            case UVC_GET_MAX:
-                resp->data[0] = PU_BRIGHTNESS_MAX_VAL;
-                resp->length = 2;
-                /*
-                 * For every successfully handled control
-                 * request set the request error code to no
-                 * error
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-            case UVC_GET_CUR:
-                resp->length = 2;
-                memcpy(&resp->data[0], &dev->brightness_val, resp->length);
-                /*
-                 * For every successfully handled control
-                 * request set the request error code to no
-                 * error
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-            case UVC_GET_INFO:
-                /*
-                 * We support Set and Get requests and don't
-                 * support async updates on an interrupt endpt
-                 */
-                resp->data[0] = 0x03;
-                resp->length = 1;
-                /*
-                 * For every successfully handled control
-                 * request, set the request error code to no
-                 * error.
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-            case UVC_GET_DEF:
-                resp->data[0] = PU_BRIGHTNESS_DEFAULT_VAL;
-                resp->length = 2;
-                /*
-                 * For every successfully handled control
-                 * request, set the request error code to no
-                 * error.
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-            case UVC_GET_RES:
-                resp->data[0] = PU_BRIGHTNESS_STEP_SIZE;
-                resp->length = 2;
-                /*
-                 * For every successfully handled control
-                 * request, set the request error code to no
-                 * error.
-                 */
-                dev->request_error_code.data[0] = 0x00;
-                dev->request_error_code.length = 1;
-                break;
-            default:
-                /*
-                 * We don't support this control, so STALL the
-                 * default control ep.
-                 */
-                resp->length = -EL2HLT;
-                /*
-                 * For every unsupported control request
-                 * set the request error code to appropriate
-                 * code.
-                 */
-                dev->request_error_code.data[0] = 0x07;
-                dev->request_error_code.length = 1;
-                break;
-            }
-            break;
-
-        default:
-            /*
-             * We don't support this control, so STALL the control
-             * ep.
-             */
-            resp->length = -EL2HLT;
-            /*
-             * If we were not supposed to handle this
-             * 'cs', prepare a Request Error Code response.
-             */
-            dev->request_error_code.data[0] = 0x06;
-            dev->request_error_code.length = 1;
-            break;
-        }
-
-        break;
-
-    default:
-        /*
-         * If we were not supposed to handle this
-         * 'cs', prepare a Request Error Code response.
-         */
-        dev->request_error_code.data[0] = 0x06;
-        dev->request_error_code.length = 1;
-        break;
+        iframe = clamp(iframe, format_frame_first, format_frame_last);
     }
 
-    printf("control request (req %02x cs %02x)\n", req, cs);
+    struct uvc_frame_format * frame_format;
+    uvc_get_frame_format(&frame_format, iformat, iframe);
+
+    uvc_dump_frame_format(frame_format, "FRAME");
+
+    if (frame_format->dwDefaultFrameInterval >= 100000) {
+        frame_interval = frame_format->dwDefaultFrameInterval;
+    } else {
+        frame_interval = 400000;
+    }
+
+    dwMaxPayloadTransferSize = streaming_maxpacket;
+    if (streaming_maxpacket > 1024 && streaming_maxpacket % 1024 != 0) {
+        dwMaxPayloadTransferSize -= (streaming_maxpacket / 1024) * 128;
+    }
+
+    memset(ctrl, 0, sizeof * ctrl);
+    ctrl->bmHint                   = 1;
+    ctrl->bFormatIndex             = iformat;
+    ctrl->bFrameIndex              = iframe;
+    ctrl->dwMaxVideoFrameSize      = get_frame_size(frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
+    ctrl->dwMaxPayloadTransferSize = dwMaxPayloadTransferSize;
+    ctrl->dwFrameInterval          = frame_interval;
+    ctrl->bmFramingInfo            = 3;
+    ctrl->bMinVersion              = format_first;
+    ctrl->bMaxVersion              = format_last;
+    ctrl->bPreferedVersion         = format_last;
+
+    dump_uvc_streaming_control(ctrl);
+
+    if (uvc_dev.control == UVC_VS_COMMIT_CONTROL && action == STREAM_CONTROL_SET) {
+        if (settings.source_device == DEVICE_TYPE_V4L2) {
+            v4l2_apply_format(&v4l2_dev, frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
+        }
+        v4l2_apply_format(&uvc_dev, frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
+    }
 }
 
-static void uvc_events_process_streaming(struct uvc_device *dev, uint8_t req, uint8_t cs, struct uvc_request_data *resp)
+static void uvc_interface_control(unsigned int interface,
+    uint8_t req, uint8_t cs, uint8_t len, struct uvc_request_data * resp)
 {
-    struct uvc_streaming_control *ctrl;
+    int i;
+    bool found = false;
+    const char * request_code_name = uvc_request_code_name(req);
+    const char * interface_name = (interface == UVC_VC_INPUT_TERMINAL) ? "INPUT_TERMINAL" : "PROCESSING_UNIT";
 
-    printf("streaming request (req %02x cs %02x)\n", req, cs);
+    for (i = 0; i < control_mapping_size; i++) {
+        if (control_mapping[i].type == interface && control_mapping[i].uvc == cs) {
+            found = true;
+            break;
+        }
+    }
 
-    if (cs != UVC_VS_PROBE_CONTROL && cs != UVC_VS_COMMIT_CONTROL)
+    if (!found) {
+        printf("UVC: %s - %s - %02x - UNSUPPORTED\n", interface_name, request_code_name, cs);
+        resp->length = -EL2HLT;
+        uvc_dev.request_error_code = REQEC_INVALID_CONTROL;
         return;
+    }
 
-    ctrl = (struct uvc_streaming_control *)&resp->data;
-    resp->length = sizeof *ctrl;
+    if (!control_mapping[i].enabled) {
+        printf("UVC: %s - %s - %s - DISABLED\n", interface_name, request_code_name,
+            control_mapping[i].uvc_name);
+        resp->length = -EL2HLT;
+        uvc_dev.request_error_code = REQEC_INVALID_CONTROL;
+        return;
+    }
+
+    printf("UVC: %s - %s - %s\n", interface_name, request_code_name, control_mapping[i].uvc_name);
 
     switch (req) {
     case UVC_SET_CUR:
-        dev->control = cs;
-        resp->length = 34;
-        break;
-
-    case UVC_GET_CUR:
-        if (cs == UVC_VS_PROBE_CONTROL)
-            memcpy(ctrl, &dev->probe, sizeof *ctrl);
-        else
-            memcpy(ctrl, &dev->commit, sizeof *ctrl);
+        resp->data[0] = 0x0;
+        resp->length = len;
+        uvc_dev.control_interface = interface;
+        uvc_dev.control_type = cs;
+        uvc_dev.request_error_code = REQEC_NO_ERROR;
         break;
 
     case UVC_GET_MIN:
+        resp->length = 4;
+        memcpy(&resp->data[0], &control_mapping[i].minimum, resp->length);
+        uvc_dev.request_error_code = REQEC_NO_ERROR;
+        break;
+
     case UVC_GET_MAX:
+        resp->length = 4;
+        memcpy(&resp->data[0], &control_mapping[i].maximum, resp->length);
+        uvc_dev.request_error_code = REQEC_NO_ERROR;
+        break;
+
+    case UVC_GET_CUR:
+        resp->length = 4;
+        memcpy(&resp->data[0], &control_mapping[i].value, resp->length);
+        uvc_dev.request_error_code = REQEC_NO_ERROR;
+        break;
+
+    case UVC_GET_INFO:
+        resp->data[0] = (uint8_t)(UVC_CONTROL_CAP_GET | UVC_CONTROL_CAP_SET);
+        resp->length = 1;
+        uvc_dev.request_error_code = REQEC_NO_ERROR;
+        break;
+
     case UVC_GET_DEF:
-        uvc_fill_streaming_control(dev, ctrl, req == UVC_GET_MAX ? -1 : 0, req == UVC_GET_MAX ? -1 : 0);
+        resp->length = 4;
+        memcpy(&resp->data[0], &control_mapping[i].default_value, resp->length);
+        uvc_dev.request_error_code = REQEC_NO_ERROR;
+        break;
+
+    case UVC_GET_RES:
+        resp->length = 4;
+        memcpy(&resp->data[0], &control_mapping[i].step, resp->length);
+        uvc_dev.request_error_code = REQEC_NO_ERROR;
+        break;
+
+    default:
+        resp->length = -EL2HLT;
+        uvc_dev.request_error_code = REQEC_INVALID_REQUEST;
+        break;
+
+    }
+    return;
+}
+
+static void uvc_events_process_streaming(uint8_t req, uint8_t cs, struct uvc_request_data * resp)
+{
+    printf("UVC: Streaming request CS: %s, REQ: %s\n", uvc_vs_interface_control_name(cs),
+        uvc_request_code_name(req));
+
+    if (cs != UVC_VS_PROBE_CONTROL && cs != UVC_VS_COMMIT_CONTROL) {
+        return;
+    }
+
+    struct uvc_streaming_control * ctrl = (struct uvc_streaming_control *) &resp->data;
+    struct uvc_streaming_control * target = (cs == UVC_VS_PROBE_CONTROL) ? &(uvc_dev.probe) : &(uvc_dev.commit);
+
+    int ctrl_length = sizeof * ctrl;
+    resp->length = ctrl_length;
+
+    switch (req) {
+    case UVC_SET_CUR:
+        uvc_dev.control = cs;
+        resp->length = ctrl_length;
+        break;
+
+    case UVC_GET_MAX:
+        uvc_fill_streaming_control(ctrl, STREAM_CONTROL_MAX, 0, 0);
+        break;
+
+    case UVC_GET_CUR:
+        memcpy(ctrl, target, ctrl_length);
+        break;
+
+    case UVC_GET_MIN:
+    case UVC_GET_DEF:
+        uvc_fill_streaming_control(ctrl, STREAM_CONTROL_MIN, 0, 0);
         break;
 
     case UVC_GET_RES:
@@ -1698,54 +1587,53 @@ static void uvc_events_process_streaming(struct uvc_device *dev, uint8_t req, ui
 
     case UVC_GET_LEN:
         resp->data[0] = 0x00;
-        resp->data[1] = 0x22;
+        resp->data[1] = ctrl_length;
         resp->length = 2;
         break;
 
     case UVC_GET_INFO:
-        resp->data[0] = 0x03;
+        resp->data[0] = (uint8_t)(UVC_CONTROL_CAP_GET | UVC_CONTROL_CAP_SET);
         resp->length = 1;
         break;
     }
 }
 
-static void
-uvc_events_process_class(struct uvc_device *dev, struct usb_ctrlrequest *ctrl, struct uvc_request_data *resp)
+static void uvc_events_process_class(struct usb_ctrlrequest * ctrl, struct uvc_request_data * resp)
 {
-    if ((ctrl->bRequestType & USB_RECIP_MASK) != USB_RECIP_INTERFACE)
-        return;
+    uint8_t type = ctrl->wIndex & 0xff;
+    uint8_t interface = ctrl->wIndex >> 8;
+    uint8_t control = ctrl->wValue >> 8;
+    uint8_t length = ctrl->wLength;
 
-    switch (ctrl->wIndex & 0xff) {
+    if ((ctrl->bRequestType & USB_RECIP_MASK) != USB_RECIP_INTERFACE) {
+        return;
+    }
+
+    switch (type) {
     case UVC_INTF_CONTROL:
-        uvc_events_process_control(dev, ctrl->bRequest, ctrl->wValue >> 8, ctrl->wIndex >> 8, ctrl->wLength, resp);
+        switch (interface) {
+            case 0:
+                if (control == UVC_VC_REQUEST_ERROR_CODE_CONTROL) {
+                    resp->data[0] = uvc_dev.request_error_code;
+                    resp->length = 1;
+                }
+                break;
+
+            case 1:
+                uvc_interface_control(UVC_VC_INPUT_TERMINAL, ctrl->bRequest, control, length, resp);
+                break;
+
+            case 2:
+                uvc_interface_control(UVC_VC_PROCESSING_UNIT, ctrl->bRequest, control, length, resp);
+                break;
+
+            default:
+                break;
+        }
         break;
 
     case UVC_INTF_STREAMING:
-        uvc_events_process_streaming(dev, ctrl->bRequest, ctrl->wValue >> 8, resp);
-        break;
-
-    default:
-        break;
-    }
-}
-static void
-uvc_events_process_setup(struct uvc_device *dev, struct usb_ctrlrequest *ctrl, struct uvc_request_data *resp)
-{
-    dev->control = 0;
-
-#ifdef ENABLE_USB_REQUEST_DEBUG
-    printf(
-        "\nbRequestType %02x bRequest %02x wValue %04x wIndex %04x "
-        "wLength %04x\n",
-        ctrl->bRequestType, ctrl->bRequest, ctrl->wValue, ctrl->wIndex, ctrl->wLength);
-#endif
-    switch (ctrl->bRequestType & USB_TYPE_MASK) {
-    case USB_TYPE_STANDARD:
-        uvc_events_process_standard(dev, ctrl, resp);
-        break;
-
-    case USB_TYPE_CLASS:
-        uvc_events_process_class(dev, ctrl, resp);
+        uvc_events_process_streaming(ctrl->bRequest, control, resp);
         break;
 
     default:
@@ -1753,611 +1641,729 @@ uvc_events_process_setup(struct uvc_device *dev, struct usb_ctrlrequest *ctrl, s
     }
 }
 
-static int
-uvc_events_process_control_data(struct uvc_device *dev, uint8_t cs, uint8_t entity_id, struct uvc_request_data *data)
+static void uvc_events_process_setup(struct usb_ctrlrequest * ctrl, struct uvc_request_data * resp)
 {
-    switch (entity_id) {
-    /* Processing unit 'UVC_VC_PROCESSING_UNIT'. */
-    case 2:
-        switch (cs) {
-        /*
-         * We support only 'UVC_PU_BRIGHTNESS_CONTROL' for Processing
-         * Unit, as our bmControls[0] = 1 for PU.
-         */
-        case UVC_PU_BRIGHTNESS_CONTROL:
-            memcpy(&dev->brightness_val, data->data, data->length);
-            /* UVC - V4L2 integrated path. */
-            if (!dev->run_standalone)
-                /*
-                 * Try to change the Brightness attribute on
-                 * Video capture device. Note that this try may
-                 * succeed or end up with some error on the
-                 * video capture side. By default to keep tools
-                 * like USBCV's UVC test suite happy, we are
-                 * maintaining a local copy of the current
-                 * brightness value in 'dev->brightness_val'
-                 * variable and we return the same value to the
-                 * Host on receiving a GET_CUR(BRIGHTNESS)
-                 * control request.
-                 *
-                 * FIXME: Keeping in view the point discussed
-                 * above, notice that we ignore the return value
-                 * from the function call below. To be strictly
-                 * compliant, we should return the same value
-                 * accordingly.
-                 */
-                v4l2_set_ctrl(dev->vdev, dev->brightness_val, V4L2_CID_BRIGHTNESS);
-            break;
-
-        default:
-            break;
-        }
-
-        break;
-
-    default:
-        break;
+    uvc_dev.control = 0;
+    if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS) {
+        uvc_events_process_class(ctrl, resp);
     }
 
-    printf("Control Request data phase (cs %02x entity %02x)\n", cs, entity_id);
-
-    return 0;
+    if (ioctl(uvc_dev.fd, UVCIOC_SEND_RESPONSE, resp) < 0) {
+        printf("UVCIOC_SEND_RESPONSE failed: %s (%d)\n", strerror(errno), errno);
+    }
 }
 
-static int uvc_events_process_data(struct uvc_device *dev, struct uvc_request_data *data)
+static void uvc_events_process_data_control(struct uvc_request_data * data, struct uvc_streaming_control * target)
 {
-    struct uvc_streaming_control *target;
-    struct uvc_streaming_control *ctrl;
-    //struct v4l2_format fmt;
-    const struct uvc_format_info *format;
-    const struct uvc_frame_info *frame;
-    const unsigned int *interval;
-    unsigned int iformat, iframe;
-    unsigned int nframes;
-    unsigned int *val = (unsigned int *)data->data;
-    int ret;
+    struct uvc_streaming_control * ctrl = (struct uvc_streaming_control *) &data->data;
+    unsigned int iformat = (unsigned int) ctrl->bFormatIndex;
+    unsigned int iframe = (unsigned int) ctrl->bFrameIndex;
 
-    switch (dev->control) {
+    uvc_fill_streaming_control(target, STREAM_CONTROL_SET, iformat, iframe);
+}
+
+static void uvc_events_process_data(struct uvc_request_data * data)
+{
+    int i;
+    printf("UVC: Control %s, length: %d\n", uvc_vs_interface_control_name(uvc_dev.control), data->length);
+
+    switch (uvc_dev.control) {
     case UVC_VS_PROBE_CONTROL:
-        printf("setting probe control, length = %d\n", data->length);
-        target = &dev->probe;
+        uvc_events_process_data_control(data, &(uvc_dev.probe));
         break;
 
     case UVC_VS_COMMIT_CONTROL:
-        printf("setting commit control, length = %d\n", data->length);
-        target = &dev->commit;
+        uvc_events_process_data_control(data, &(uvc_dev.commit));
+        break;
+
+    case UVC_VS_CONTROL_UNDEFINED:
+        if (data->length > 0 && data->length <= 4) {
+            for (i = 0; i < control_mapping_size; i++) {
+                if (control_mapping[i].type == uvc_dev.control_interface &&
+                    control_mapping[i].uvc == uvc_dev.control_type &&
+                    control_mapping[i].enabled
+                ) {
+                    control_mapping[i].value = 0x00000000;
+                    control_mapping[i].length = data->length;
+                    memcpy(&control_mapping[i].value, data->data, data->length);
+                    v4l2_set_ctrl(control_mapping[i]);
+                }
+            }
+        }
         break;
 
     default:
-        printf("setting unknown control, length = %d\n", data->length);
-
-        /*
-         * As we support only BRIGHTNESS control, this request is
-         * for setting BRIGHTNESS control.
-         * Check for any invalid SET_CUR(BRIGHTNESS) requests
-         * from Host. Note that we support Brightness levels
-         * from 0x0 to 0x10 in a step of 0x1. So, any request
-         * with value greater than 0x10 is invalid.
-         */
-        if (*val > PU_BRIGHTNESS_MAX_VAL) {
-            return -EINVAL;
-        } else {
-            ret = uvc_events_process_control_data(dev, UVC_PU_BRIGHTNESS_CONTROL, 2, data);
-            if (ret < 0)
-                goto err;
-
-            return 0;
-        }
-    }
-
-    ctrl = (struct uvc_streaming_control *)&data->data;
-    iformat = clamp((unsigned int)ctrl->bFormatIndex, 1U, (unsigned int)ARRAY_SIZE(uvc_formats));
-    format = &uvc_formats[iformat - 1];
-
-    nframes = 0;
-    while (format->frames[nframes].width != 0)
-        ++nframes;
-
-    iframe = clamp((unsigned int)ctrl->bFrameIndex, 1U, nframes);
-    frame = &format->frames[iframe - 1];
-    interval = frame->intervals;
-
-    while (interval[0] < ctrl->dwFrameInterval && interval[1])
-        ++interval;
-
-    target->bFormatIndex = iformat;
-    target->bFrameIndex = iframe;
-    switch (format->fcc) {
-    case V4L2_PIX_FMT_YUYV:
-        target->dwMaxVideoFrameSize = frame->width * frame->height * 2;
-        break;
-    case V4L2_PIX_FMT_MJPEG:
-        if (dev->imgsize == 0)
-            printf("WARNING: MJPEG requested and no image loaded.\n");
-        target->dwMaxVideoFrameSize = dev->imgsize;
+        printf("UVC: Setting unknown control, length = %d\n", data->length);
         break;
     }
-    target->dwFrameInterval = *interval;
-
-    if (dev->control == UVC_VS_COMMIT_CONTROL) {
-        dev->fcc = format->fcc;
-        dev->width = frame->width;
-        dev->height = frame->height;
-    }
-
-    return 0;
-
-err:
-    return ret;
 }
 
-static void uvc_events_process(struct uvc_device *dev)
+static void uvc_events_process()
 {
     struct v4l2_event v4l2_event;
-    struct uvc_event *uvc_event = (void *)&v4l2_event.u.data;
+    struct uvc_event * uvc_event = (void *) &v4l2_event.u.data;
     struct uvc_request_data resp;
-    int ret;
 
-    ret = ioctl(dev->uvc_fd, VIDIOC_DQEVENT, &v4l2_event);
-    if (ret < 0) {
-        printf("VIDIOC_DQEVENT failed: %s (%d)\n", strerror(errno), errno);
+    if (ioctl(uvc_dev.fd, VIDIOC_DQEVENT, &v4l2_event) < 0) {
+        printf("%s: VIDIOC_DQEVENT failed: %s (%d)\n",
+            uvc_dev.device_type_name, strerror(errno), errno);
         return;
     }
 
-    memset(&resp, 0, sizeof resp);
+    CLEAR(resp);
     resp.length = -EL2HLT;
 
     switch (v4l2_event.type) {
     case UVC_EVENT_CONNECT:
-        return;
+        printf("%s: UVC_EVENT_CONNECT\n", uvc_dev.device_type_name);
+        break;
 
     case UVC_EVENT_DISCONNECT:
-        dev->uvc_shutdown_requested = 1;
-        printf(
-            "UVC: Possible USB shutdown requested from "
-            "Host, seen via UVC_EVENT_DISCONNECT\n");
-        return;
+        printf("%s: UVC_EVENT_DISCONNECT\n", uvc_dev.device_type_name);
+        uvc_shutdown_requested = true;
+        break;
 
     case UVC_EVENT_SETUP:
-        uvc_events_process_setup(dev, &uvc_event->req, &resp);
+        uvc_events_process_setup(&uvc_event->req, &resp);
         break;
 
     case UVC_EVENT_DATA:
-        ret = uvc_events_process_data(dev, &uvc_event->data);
-        if (ret < 0)
-            break;
-        return;
+        uvc_events_process_data(&uvc_event->data);
+        break;
 
     case UVC_EVENT_STREAMON:
-        if (!dev->bulk)
-            uvc_handle_streamon_event(dev);
-        return;
+        uvc_handle_streamon_event();
+        break;
 
     case UVC_EVENT_STREAMOFF:
-        /* Stop V4L2 streaming... */
-        if (!dev->run_standalone && dev->vdev->is_streaming) {
-            /* UVC - V4L2 integrated path. */
-            v4l2_stop_capturing(dev->vdev);
-            dev->vdev->is_streaming = 0;
-        }
+        uvc_handle_streamoff_event();
+        break;
 
-        /* ... and now UVC streaming.. */
-        if (dev->is_streaming) {
-            uvc_video_stream(dev, 0);
-            uvc_uninit_device(dev);
-            uvc_video_reqbufs(dev, 0);
-            dev->is_streaming = 0;
-            dev->first_buffer_queued = 0;
-        }
-
-        return;
-    }
-
-    ret = ioctl(dev->uvc_fd, UVCIOC_SEND_RESPONSE, &resp);
-    if (ret < 0) {
-        printf("UVCIOC_S_EVENT failed: %s (%d)\n", strerror(errno), errno);
-        return;
+    default:
+        break;
     }
 }
 
-static void uvc_events_init(struct uvc_device *dev)
+static void uvc_events(int action)
 {
     struct v4l2_event_subscription sub;
-    unsigned int payload_size;
+    CLEAR(sub);
 
-    switch (dev->fcc) {
-    case V4L2_PIX_FMT_YUYV:
-        payload_size = dev->width * dev->height * 2;
-        break;
-    case V4L2_PIX_FMT_MJPEG:
-        payload_size = dev->imgsize;
-        break;
-    }
-
-    uvc_fill_streaming_control(dev, &dev->probe, 0, 0);
-    uvc_fill_streaming_control(dev, &dev->commit, 0, 0);
-
-    if (dev->bulk) {
-        /* FIXME Crude hack, must be negotiated with the driver. */
-        dev->probe.dwMaxPayloadTransferSize = dev->commit.dwMaxPayloadTransferSize = payload_size;
-    }
-
-    memset(&sub, 0, sizeof sub);
+    sub.type = UVC_EVENT_CONNECT;
+    ioctl(uvc_dev.fd, action, &sub);
+    sub.type = UVC_EVENT_DISCONNECT;
+    ioctl(uvc_dev.fd, action, &sub);
     sub.type = UVC_EVENT_SETUP;
-    ioctl(dev->uvc_fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+    ioctl(uvc_dev.fd, action, &sub);
     sub.type = UVC_EVENT_DATA;
-    ioctl(dev->uvc_fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+    ioctl(uvc_dev.fd, action, &sub);
     sub.type = UVC_EVENT_STREAMON;
-    ioctl(dev->uvc_fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+    ioctl(uvc_dev.fd, action, &sub);
     sub.type = UVC_EVENT_STREAMOFF;
-    ioctl(dev->uvc_fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
+    ioctl(uvc_dev.fd, action, &sub);
 }
+
+static void uvc_events_subscribe()
+{
+    uvc_events(VIDIOC_SUBSCRIBE_EVENT);
+}
+
+static void uvc_events_unsubscribe()
+{
+    uvc_events(VIDIOC_UNSUBSCRIBE_EVENT);
+}
+
 
 /* ---------------------------------------------------------------------------
  * main
  */
 
-static void image_load(struct uvc_device *dev, const char *img)
+static void processing_loop_v4l2_uvc()
 {
-    int fd = -1;
+    struct timeval tv;
+    struct timeval video_tv;
+    double last_time_blink = 0;
+    bool blink_state = false;
+    int activity;
+    fd_set fdsv, fdsu;
+    int nfds;
 
-    if (img == NULL)
-        return;
+    printf("PROCESSING LOOP: V4L2 -> UVC\n");
 
-    fd = open(img, O_RDONLY);
-    if (fd == -1) {
-        printf("Unable to open MJPEG image '%s'\n", img);
-        return;
+    while (!terminate) {
+        FD_ZERO(&fdsv);
+        FD_ZERO(&fdsu);
+
+        /* We want both setup and data events on UVC interface.. */
+        FD_SET(uvc_dev.fd, &fdsu);
+
+        fd_set efds = fdsu;
+        fd_set dfds = fdsu;
+
+        /* yield CPU to other processes and avoid spinlock when camera is not being used
+         * fix from - https://github.com/kinweilee/v4l2-mmal-uvc/blob/master/v4l2-mmal-uvc.c
+         * rcarmo - https://github.com/peterbay/uvc-gadget/pull/6
+         */
+        nanosleep ((const struct timespec[]) { {0, 1000000L} }, NULL);
+
+        /* Timeout. */
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        /* don't block vdev device if streaming is off */
+        if (v4l2_dev.is_streaming) {
+            /* ..but only data events on V4L2 interface */
+            FD_SET(v4l2_dev.fd, &fdsv);
+
+            nfds = max(v4l2_dev.fd, uvc_dev.fd);
+            activity = select(nfds + 1, &fdsv, &dfds, &efds, &tv);
+
+            if (activity == 0) {
+                printf("PROCESSING: Select timeout\n");
+                break;
+            }
+
+        } else {
+            activity = select(uvc_dev.fd + 1, NULL, &dfds, &efds, NULL);
+
+        }
+
+        if (activity == -1) {
+            printf("PROCESSING: Select error %d, %s\n", errno, strerror(errno));
+            if (EINTR == errno) {
+                continue;
+            }
+            break;
+        }
+
+        gettimeofday(&video_tv, 0);
+        double now = (video_tv.tv_sec + (video_tv.tv_usec * 1e-6)) * 1000;
+
+        if (FD_ISSET(uvc_dev.fd, &efds)) {
+            uvc_events_process();
+        }
+
+        if (v4l2_dev.is_streaming) {
+            if (FD_ISSET(uvc_dev.fd, &dfds)) {
+                uvc_v4l2_video_process();
+            }
+
+            if (FD_ISSET(v4l2_dev.fd, &fdsv)) {
+                v4l2_uvc_video_process();
+            }
+
+            if (settings.show_fps) {
+                if (now - uvc_dev.last_time_video_process >= 1000) {
+                    printf("FPS: %d\n", uvc_dev.buffers_processed);
+                    uvc_dev.buffers_processed = 0;
+                    uvc_dev.last_time_video_process = now;
+                }
+            }
+        }
+        
+        if (settings.blink_on_startup > 0) {
+            if (now - last_time_blink >= 100) {
+                blink_state = !(blink_state);
+                streaming_status_value(blink_state);
+                last_time_blink = now;
+                if (!blink_state) {
+                    settings.blink_on_startup -= 1;
+                }
+            }
+        }
     }
-
-    dev->imgsize = lseek(fd, 0, SEEK_END);
-    lseek(fd, 0, SEEK_SET);
-    dev->imgdata = malloc(dev->imgsize);
-    if (dev->imgdata == NULL) {
-        printf("Unable to allocate memory for MJPEG image\n");
-        dev->imgsize = 0;
-        return;
-    }
-
-    read(fd, dev->imgdata, dev->imgsize);
-    close(fd);
 }
 
-static void usage(const char *argv0)
+static void processing_loop_fb_uvc() 
+{
+    struct timeval video_tv;
+    int activity;
+    double next_frame_time = 0;
+    double last_time_blink = 0;
+    bool blink_state = false;
+    double now;
+    fd_set fdsu;
+
+    int frame_interval = (1000 / settings.fb_framerate);
+
+    printf("PROCESSING LOOP: FB -> UVC\n");
+
+    while (!terminate) {
+        FD_ZERO(&fdsu);
+        FD_SET(uvc_dev.fd, &fdsu);
+
+        fd_set efds = fdsu;
+        fd_set dfds = fdsu;
+
+        nanosleep ((const struct timespec[]) { {0, 1000000L} }, NULL);
+
+        activity = select(uvc_dev.fd + 1, NULL, &dfds, &efds, NULL);
+
+        if (activity == -1) {
+            printf("PROCESSING: Select error %d, %s\n", errno, strerror(errno));
+            if (EINTR == errno) {
+                continue;
+            }
+            break;
+        }
+
+        if (activity == 0) {
+            printf("PROCESSING: Select timeout\n");
+            break;
+        }
+
+        if (FD_ISSET(uvc_dev.fd, &efds)) {
+            uvc_events_process();
+        }
+
+        gettimeofday(&video_tv, 0);
+        now = (video_tv.tv_sec + (video_tv.tv_usec * 1e-6)) * 1000;
+
+        if (FD_ISSET(uvc_dev.fd, &dfds)) {
+            if (now >= next_frame_time) {
+                uvc_fb_video_process();
+                next_frame_time = now + frame_interval;
+            }
+        }
+
+        if (settings.show_fps) {
+            if (now - uvc_dev.last_time_video_process >= 1000) {
+                printf("FPS: %d\n", uvc_dev.buffers_processed);
+                uvc_dev.buffers_processed = 0;
+                uvc_dev.last_time_video_process = now;
+            }
+        }
+
+        if (settings.blink_on_startup > 0) {
+            if (now - last_time_blink >= 100) {
+                blink_state = !(blink_state);
+                streaming_status_value(blink_state);
+                last_time_blink = now;
+                if (!blink_state) {
+                    settings.blink_on_startup -= 1;
+                }
+            }
+        }
+    }
+}
+
+static int init()
+{
+    int ret;
+
+    memset(&v4l2_dev, 0, sizeof(v4l2_dev));
+    memset(&uvc_dev, 0, sizeof(uvc_dev));
+
+    streaming_status_enable();
+
+    /* Open the UVC device. */
+    ret = uvc_open(settings.uvc_devname, settings.nbufs);
+    if (ret < 0) {
+        goto err;
+    }
+
+    if (settings.source_device == DEVICE_TYPE_FRAMEBUFFER) {
+        /* Open the Frame Buffer device. */
+        ret = fb_open(settings.fb_devname);
+        if (ret < 0) {
+            goto err;
+        }
+
+    } else {
+        /* Open the V4L2 device. */
+        ret = v4l2_open(settings.v4l2_devname, settings.nbufs);
+        if (ret < 0) {
+           goto err;
+        }
+
+        v4l2_get_available_formats();
+        v4l2_get_controls();
+    }
+
+    /* Init UVC events. */
+    uvc_fill_streaming_control(&(uvc_dev.probe), STREAM_CONTROL_INIT, 0, 0);
+    uvc_fill_streaming_control(&(uvc_dev.commit), STREAM_CONTROL_INIT, 0, 0);
+
+    uvc_events_subscribe();
+
+    if (settings.source_device == DEVICE_TYPE_FRAMEBUFFER) {
+        processing_loop_fb_uvc();
+    } else {
+        processing_loop_v4l2_uvc();
+    } 
+ 
+    uvc_events_unsubscribe();
+
+    printf("\n*** UVC GADGET SHUTDOWN ***\n");
+
+    uvc_handle_streamoff_event();
+
+err:
+    v4l2_close();
+    fb_close();
+    uvc_close();
+
+    printf("*** UVC GADGET EXIT ***\n");
+    return 1;
+}
+
+static int find_text_pos(const char * s, const char * f)
+{
+  char * p = strstr(s, f);
+  return (p) ? p - s : 0;
+}
+
+static int configfs_read_value(const char * path)
+{
+    char buf[20];
+    int fd;
+    int ret;
+
+    fd = open(path, O_RDONLY); 
+    if (fd == -1) {
+        return -ENOENT;
+    }
+    ret = read(fd, buf, 20);
+    close(fd);
+
+    if (ret < 0 || ret > 10) {
+        return -ENODATA;
+    }
+    buf[ret] = '\0';
+    return strtol(buf, NULL, 10);
+}
+
+static void set_uvc_format_index(enum usb_device_speed usb_speed, int video_format,
+    unsigned int bFormatIndex)
+{
+    int i;
+    for (i = 0; i <= last_format_index; i++) {
+        if (uvc_frame_format[i].usb_speed == usb_speed &&
+            uvc_frame_format[i].video_format == video_format
+        ) {
+            uvc_frame_format[i].bFormatIndex = bFormatIndex;
+        }
+    }
+}
+
+static void set_uvc_format_value(const char * key_word, unsigned int index, int value)
+{
+    if (!strncmp(key_word, "dwDefaultFrameInterval", 22)) {
+        uvc_frame_format[index].dwDefaultFrameInterval = value;
+
+    } else if (!strncmp(key_word, "dwMaxVideoFrameBufferSize", 25)) {
+        uvc_frame_format[index].dwMaxVideoFrameBufferSize = value;
+
+    } else if (!strncmp(key_word, "dwMaxBitRate", 12)) {
+        uvc_frame_format[index].dwMaxBitRate = value;
+
+    } else if (!strncmp(key_word, "dwMinBitRate", 12)) {
+        uvc_frame_format[index].dwMinBitRate = value;
+
+    } else if (!strncmp(key_word, "wHeight", 7)) {
+        uvc_frame_format[index].wHeight = value;
+
+    } else if (!strncmp(key_word, "wWidth", 6)) {
+        uvc_frame_format[index].wWidth = value;
+
+    } else if (!strncmp(key_word, "bmCapabilities", 14)) {
+        uvc_frame_format[index].bmCapabilities = value;
+
+    } else if (!strncmp(key_word, "bFrameIndex", 11)) {
+        uvc_frame_format[index].bFrameIndex = value;
+
+    }
+}
+
+static int configfs_usb_speed(const char * speed)
+{
+    if (!strncmp(speed, "fs", 2)) {
+        return USB_SPEED_FULL;
+
+    } else if (!strncmp(speed, "hs", 2)) {
+        return USB_SPEED_HIGH;
+
+    } else if (!strncmp(speed, "ss", 2)) {
+        return USB_SPEED_SUPER;
+
+    }
+    return USB_SPEED_UNKNOWN;
+}
+
+static int configfs_video_format(const char * format)
+{
+    if (!strncmp(format, "m", 1)) {
+        return V4L2_PIX_FMT_MJPEG;
+
+    } else if (!strncmp(format, "u", 1)) {
+        return V4L2_PIX_FMT_YUYV;
+
+    }
+    return 0;
+}
+
+static void configfs_fill_formats(const char * path, const char * part)
+{
+    int index = 0;
+    int value = 0;
+    enum usb_device_speed usb_speed;
+    int video_format;
+    const char * format_name;
+    char * copy = strdup(part);
+    char * token = strtok(copy, "/");
+    char * array[10];
+    
+    while (token != NULL)
+    {
+        array[index++] = token;
+        token = strtok (NULL, "/");
+    }
+
+    if (index > 3) {
+        format_name = array[3];
+
+        usb_speed = configfs_usb_speed(array[0]);
+        if (usb_speed == USB_SPEED_UNKNOWN) {
+            printf("CONFIGFS: Unsupported USB speed: (%s) %s\n", array[0], path);
+            goto free;
+        }
+
+        video_format = configfs_video_format(array[2]);
+        if (video_format == 0) {
+            printf("CONFIGFS: Unsupported format: (%s) %s\n", array[2], path);
+            goto free;
+        }
+
+        value = configfs_read_value(path);
+        if (value < 0) {
+            goto free;
+        }
+
+        if (!strncmp(array[index - 1], "bFormatIndex", 12)) {
+            set_uvc_format_index(usb_speed, video_format, value);
+            goto free;
+        }
+
+        if (index != 5) {
+            goto free;
+        }
+
+        if (
+            uvc_frame_format[last_format_index].usb_speed != usb_speed ||
+            uvc_frame_format[last_format_index].video_format != video_format ||
+            strncmp(uvc_frame_format[last_format_index].format_name, format_name, strlen(format_name))
+        ) {
+            if (uvc_frame_format[last_format_index].defined) {
+                last_format_index++;
+                
+                /* too much defined formats */
+                if (last_format_index > 29) {
+                    goto free;
+                }
+            }
+
+            uvc_frame_format[last_format_index].usb_speed = usb_speed;
+            uvc_frame_format[last_format_index].video_format = video_format;
+            uvc_frame_format[last_format_index].format_name = strdup(format_name);
+            uvc_frame_format[last_format_index].defined = true;
+        }
+
+        set_uvc_format_value(array[index - 1], last_format_index, value);
+    }
+
+free:
+    free(copy);
+}
+
+static void configfs_fill_streaming_params(const char* path, const char * part)
+{
+    int value = configfs_read_value(path);
+
+    /*
+     * streaming_maxburst   0..15 (ss only)
+     * streaming_maxpacket  1..1023 (fs), 1..3072 (hs/ss)
+     * streaming_interval   1..16
+     */
+
+    if (!strncmp(part, "maxburst", 8)) {
+        streaming_maxburst = clamp(value, 0, 15);
+
+    } else if (!strncmp(part, "maxpacket", 9)) {
+        streaming_maxpacket = clamp(value, 1, 3072);
+
+    } else if (!strncmp(part, "interval", 8)) {
+        streaming_interval = clamp(value, 1, 16);
+
+    }
+}
+
+static int configfs_path_check(const char* fpath, const struct stat * sb, int tflag)
+{
+    int uvc = find_text_pos(fpath, "/uvc");
+    int streaming = find_text_pos(fpath, "streaming/class/");
+    int streaming_params = find_text_pos(fpath, "/streaming_");
+    (void)(tflag); /* avoid warning: unused parameter 'tflag' */
+
+    if (!S_ISDIR(sb->st_mode)) {
+        if (streaming && uvc) {
+            configfs_fill_formats(fpath, fpath + streaming + 16);
+
+        } else if (streaming_params) {
+            configfs_fill_streaming_params(fpath, fpath + streaming_params + 11);
+
+        }
+    }
+    return 0;
+}
+
+static int configfs_get_uvc_settings()
+{
+    int i;
+    const char * configfs_path = "/sys/kernel/config/usb_gadget";
+
+    printf("CONFIGFS: Initial path: %s\n", configfs_path);
+
+    if(ftw(configfs_path, configfs_path_check, 20) == -1) {
+        return -1;
+    }
+
+    if (!uvc_frame_format[0].defined) {
+        return -1;
+    }
+
+    for (i = 0; i <= last_format_index; i++) {
+        uvc_dump_frame_format(&uvc_frame_format[i], "CONFIGFS: UVC");
+    }
+
+    printf("CONFIGFS: STREAMING maxburst:  %d\n", streaming_maxburst);
+    printf("CONFIGFS: STREAMING maxpacket: %d\n", streaming_maxpacket);
+    printf("CONFIGFS: STREAMING interval:  %d\n", streaming_interval);
+
+    return 0;
+}
+
+static void usage(const char * argv0)
 {
     fprintf(stderr, "Usage: %s [options]\n", argv0);
     fprintf(stderr, "Available options are\n");
-    fprintf(stderr, " -b		Use bulk mode\n");
-    fprintf(stderr, " -d		Do not use any real V4L2 capture device\n");
-    fprintf(stderr,
-            " -f <format>    Select frame format\n\t"
-            "0 = V4L2_PIX_FMT_YUYV\n\t"
-            "1 = V4L2_PIX_FMT_MJPEG\n");
-    fprintf(stderr, " -h		Print this help screen and exit\n");
-    fprintf(stderr, " -i image	MJPEG image\n");
-    fprintf(stderr, " -m		Streaming mult for ISOC (b/w 0 and 2)\n");
-    fprintf(stderr, " -n		Number of Video buffers (b/w 2 and 32)\n");
-    fprintf(stderr,
-            " -o <IO method> Select UVC IO method:\n\t"
-            "0 = MMAP\n\t"
-            "1 = USER_PTR\n");
-    fprintf(stderr,
-            " -r <resolution> Select frame resolution:\n\t"
-            "0 = HEIGHT1p, VGA (WIDTH1xHEIGHT1)\n\t"
-            "1 = 720p, (WIDTH2xHEIGHT2)\n");
-    fprintf(stderr,
-            " -s <speed>	Select USB bus speed (b/w 0 and 2)\n\t"
-            "0 = Full Speed (FS)\n\t"
-            "1 = High Speed (HS)\n\t"
-            "2 = Super Speed (SS)\n");
-    fprintf(stderr, " -t		Streaming burst (b/w 0 and 15)\n");
-    fprintf(stderr, " -u device	UVC Video Output device\n");
-    fprintf(stderr, " -v device	V4L2 Video Capture device\n");
+    fprintf(stderr, " -b value    Blink X times on startup (b/w 1 and 20 with led0 or GPIO pin if defined)\n");
+    fprintf(stderr, " -f device   Framebuffer device\n");
+    fprintf(stderr, " -h          Print this help screen and exit\n");
+    fprintf(stderr, " -l          Use onboard led0 for streaming status indication\n");
+    fprintf(stderr, " -n value    Number of Video buffers (b/w 2 and 32)\n");
+    fprintf(stderr, " -p value    GPIO pin number for streaming status indication\n");
+    fprintf(stderr, " -r value    Framerate for framebuffer (b/w 1 and 30)\n");
+    fprintf(stderr, " -u device   UVC Video Output device\n");
+    fprintf(stderr, " -v device   V4L2 Video Capture device\n");
+    fprintf(stderr, " -x          show fps information\n");
 }
 
-int main(int argc, char *argv[])
+static void show_settings()
 {
-    struct uvc_device *udev;
-    struct v4l2_device *vdev;
-    struct timeval tv;
-    struct v4l2_format fmt;
-    char *uvc_devname = "/dev/video0";
-    char *v4l2_devname = "/dev/video1";
-    char *mjpeg_image = NULL;
+    printf("SETTINGS: Number of buffers requested: %d\n", settings.nbufs);
+    printf("SETTINGS: Show FPS: %s\n", (settings.show_fps) ? "ENABLED" : "DISABLED");
+    if (settings.streaming_status_pin) {
+        printf("SETTINGS: GPIO pin for streaming status: %s\n", settings.streaming_status_pin);
+    } else {
+        printf("SETTINGS: GPIO pin for streaming status: not set\n");
+    }
+    printf("SETTINGS: Onboard led0 used for streaming status: %s\n",
+        (settings.streaming_status_onboard_enabled) ? "ENABLED" : "DISABLED"
+    );
+    printf("SETTINGS: Blink on startup: %d times\n", settings.blink_on_startup);
 
-    fd_set fdsv, fdsu;
-    int ret, opt, nfds;
-    int bulk_mode = 0;
-    int dummy_data_gen_mode = 0;
-    /* Frame format/resolution related params. */
-    int default_format = 0;     /* V4L2_PIX_FMT_YUYV */
-    int default_resolution = 0; /* VGA HEIGHT1p */
-    int nbufs = 2;              /* Ping-Pong buffers */
-    /* USB speed related params */
-    int mult = 0;
-    int burst = 0;
-    enum usb_device_speed speed = USB_SPEED_SUPER; /* High-Speed */
-    enum io_method uvc_io_method = IO_METHOD_USERPTR;
+    printf("SETTINGS: UVC device name: %s\n", settings.uvc_devname);
+    if (settings.source_device == DEVICE_TYPE_FRAMEBUFFER) {
+        printf("SETTINGS: FB device name: %s\n", settings.fb_devname);
+        printf("SETTINGS: Framerate for frame buffer: %d\n", settings.fb_framerate);
 
-    while ((opt = getopt(argc, argv, "bdf:hi:m:n:o:r:s:t:u:v:")) != -1) {
+    } else {
+        printf("SETTINGS: V4L2 device name: %s\n", settings.v4l2_devname);
+    }
+}
+
+int main(int argc, char * argv[])
+{
+    int ret;
+    int opt;
+
+    struct sigaction action;
+    CLEAR(action);
+    action.sa_handler = term;
+    sigaction(SIGTERM, &action, NULL);
+    sigaction(SIGINT, &action, NULL);
+
+    ret = configfs_get_uvc_settings();
+    if (ret < 0) {
+        printf("ERROR: configfs settings for uvc gadget not found!\n");
+        return 1;
+    }
+
+    while ((opt = getopt(argc, argv, "hlb:f:n:p:r:u:v:x")) != -1) {
         switch (opt) {
         case 'b':
-            bulk_mode = 1;
-            break;
-
-        case 'd':
-            dummy_data_gen_mode = 1;
+            if (atoi(optarg) < 1 || atoi(optarg) > 20) {
+                fprintf(stderr, "ERROR: Blink x times on startup\n");
+                goto err;
+            }
+            settings.blink_on_startup = atoi(optarg);
             break;
 
         case 'f':
-            if (atoi(optarg) < 0 || atoi(optarg) > 1) {
-                usage(argv[0]);
-                return 1;
-            }
-
-            default_format = atoi(optarg);
+            settings.fb_devname = optarg;
+            settings.source_device = DEVICE_TYPE_FRAMEBUFFER;
             break;
 
         case 'h':
             usage(argv[0]);
             return 1;
 
-        case 'i':
-            mjpeg_image = optarg;
-            break;
-
-        case 'm':
-            if (atoi(optarg) < 0 || atoi(optarg) > 2) {
-                usage(argv[0]);
-                return 1;
-            }
-
-            mult = atoi(optarg);
-            printf("Requested Mult value = %d\n", mult);
+        case 'l':
+            settings.streaming_status_onboard = true;
             break;
 
         case 'n':
             if (atoi(optarg) < 2 || atoi(optarg) > 32) {
-                usage(argv[0]);
-                return 1;
+                fprintf(stderr, "ERROR: Number of Video buffers value out of range\n");
+                goto err;
             }
-
-            nbufs = atoi(optarg);
-            printf("Number of buffers requested = %d\n", nbufs);
+            settings.nbufs = atoi(optarg);
             break;
 
-        case 'o':
-            if (atoi(optarg) < 0 || atoi(optarg) > 1) {
-                usage(argv[0]);
-                return 1;
-            }
-
-            uvc_io_method = atoi(optarg);
-            printf("UVC: IO method requested is %s\n", (uvc_io_method == IO_METHOD_MMAP) ? "MMAP" : "USER_PTR");
+        case 'p':
+            settings.streaming_status_pin = optarg;
             break;
 
         case 'r':
-            if (atoi(optarg) < 0 || atoi(optarg) > 1) {
-                usage(argv[0]);
-                return 1;
+            if (atoi(optarg) < 1 || atoi(optarg) > 30) {
+                fprintf(stderr, "ERROR: Framerate value out of range\n");
+                goto err;
             }
-
-            default_resolution = atoi(optarg);
-            break;
-
-        case 's':
-            if (atoi(optarg) < 0 || atoi(optarg) > 2) {
-                usage(argv[0]);
-                return 1;
-            }
-
-            speed = atoi(optarg);
-            break;
-
-        case 't':
-            if (atoi(optarg) < 0 || atoi(optarg) > 15) {
-                usage(argv[0]);
-                return 1;
-            }
-
-            burst = atoi(optarg);
-            printf("Requested Burst value = %d\n", burst);
+            settings.fb_framerate = atoi(optarg);
             break;
 
         case 'u':
-            uvc_devname = optarg;
+            settings.uvc_devname = optarg;
             break;
 
         case 'v':
-            v4l2_devname = optarg;
+            settings.v4l2_devname = optarg;
+            break;
+
+        case 'x':
+            settings.show_fps = true;
             break;
 
         default:
-            printf("Invalid option '-%c'\n", opt);
-            usage(argv[0]);
-            return 1;
+            printf("ERROR: Invalid option '-%c'\n", opt);
+            goto err;
         }
     }
 
-    if (!dummy_data_gen_mode && !mjpeg_image) {
-        /*
-         * Try to set the default format at the V4L2 video capture
-         * device as requested by the user.
-         */
-        CLEAR(fmt);
-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        fmt.fmt.pix.width = (default_resolution == 0) ? WIDTH1 : WIDTH2;
-        fmt.fmt.pix.height = (default_resolution == 0) ? HEIGHT1 : HEIGHT2;
-        fmt.fmt.pix.sizeimage = (default_format == 0) ? (fmt.fmt.pix.width * fmt.fmt.pix.height * 2)
-                                                      : (fmt.fmt.pix.width * fmt.fmt.pix.height * 1.5);
-        fmt.fmt.pix.pixelformat = (default_format == 0) ? V4L2_PIX_FMT_YUYV : V4L2_PIX_FMT_MJPEG;
-        fmt.fmt.pix.field = V4L2_FIELD_ANY;
+    show_settings();
+    return init();
 
-        /* Open the V4L2 device. */
-        ret = v4l2_open(&vdev, v4l2_devname, &fmt);
-        if (vdev == NULL || ret < 0)
-            return 1;
-    }
-
-    /* Open the UVC device. */
-    ret = uvc_open(&udev, uvc_devname);
-    if (udev == NULL || ret < 0)
-        return 1;
-
-    udev->uvc_devname = uvc_devname;
-
-    if (!dummy_data_gen_mode && !mjpeg_image) {
-        vdev->v4l2_devname = v4l2_devname;
-        /* Bind UVC and V4L2 devices. */
-        udev->vdev = vdev;
-        vdev->udev = udev;
-    }
-
-    /* Set parameters as passed by user. */
-    udev->width = (default_resolution == 0) ? WIDTH1 : WIDTH2;
-    udev->height = (default_resolution == 0) ? HEIGHT1 : HEIGHT2;
-    udev->imgsize = (default_format == 0) ? (udev->width * udev->height * 2) : (udev->width * udev->height * 1.5);
-    udev->fcc = (default_format == 0) ? V4L2_PIX_FMT_YUYV : V4L2_PIX_FMT_MJPEG;
-    udev->io = uvc_io_method;
-    udev->bulk = bulk_mode;
-    udev->nbufs = nbufs;
-    udev->mult = mult;
-    udev->burst = burst;
-    udev->speed = speed;
-
-    if (dummy_data_gen_mode || mjpeg_image)
-        /* UVC standalone setup. */
-        udev->run_standalone = 1;
-
-    if (!dummy_data_gen_mode && !mjpeg_image) {
-        /* UVC - V4L2 integrated path */
-        vdev->nbufs = nbufs;
-
-        /*
-         * IO methods used at UVC and V4L2 domains must be
-         * complementary to avoid any memcpy from the CPU.
-         */
-        switch (uvc_io_method) {
-        case IO_METHOD_MMAP:
-            vdev->io = IO_METHOD_USERPTR;
-            break;
-
-        case IO_METHOD_USERPTR:
-        default:
-            vdev->io = IO_METHOD_MMAP;
-            break;
-        }
-    }
-
-    switch (speed) {
-    case USB_SPEED_FULL:
-        /* Full Speed. */
-        if (bulk_mode)
-            udev->maxpkt = 64;
-        else
-            udev->maxpkt = 1023;
-        break;
-
-    case USB_SPEED_HIGH:
-        /* High Speed. */
-        if (bulk_mode)
-            udev->maxpkt = 512;
-        else
-            udev->maxpkt = 1024;
-        break;
-
-    case USB_SPEED_SUPER:
-    default:
-        /* Super Speed. */
-        if (bulk_mode)
-            udev->maxpkt = 1024;
-        else
-            udev->maxpkt = 1024;
-        break;
-    }
-
-    if (!dummy_data_gen_mode && !mjpeg_image && (IO_METHOD_MMAP == vdev->io)) {
-        /*
-         * Ensure that the V4L2 video capture device has already some
-         * buffers queued.
-         */
-        v4l2_reqbufs(vdev, vdev->nbufs);
-    }
-
-    if (mjpeg_image)
-        image_load(udev, mjpeg_image);
-
-    /* Init UVC events. */
-    uvc_events_init(udev);
-
-    while (1) {
-        if (!dummy_data_gen_mode && !mjpeg_image)
-            FD_ZERO(&fdsv);
-
-        FD_ZERO(&fdsu);
-
-        /* We want both setup and data events on UVC interface.. */
-        FD_SET(udev->uvc_fd, &fdsu);
-
-        fd_set efds = fdsu;
-        fd_set dfds = fdsu;
-
-        /* ..but only data events on V4L2 interface */
-        if (!dummy_data_gen_mode && !mjpeg_image)
-            FD_SET(vdev->v4l2_fd, &fdsv);
-
-        /* Timeout. */
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
-
-        if (!dummy_data_gen_mode && !mjpeg_image) {
-            nfds = max(vdev->v4l2_fd, udev->uvc_fd);
-            ret = select(nfds + 1, &fdsv, &dfds, &efds, &tv);
-        } else {
-            ret = select(udev->uvc_fd + 1, NULL, &dfds, &efds, NULL);
-        }
-
-        if (-1 == ret) {
-            printf("select error %d, %s\n", errno, strerror(errno));
-            if (EINTR == errno)
-                continue;
-
-            break;
-        }
-
-        if (0 == ret) {
-            printf("select timeout\n");
-            break;
-        }
-
-        if (FD_ISSET(udev->uvc_fd, &efds))
-            uvc_events_process(udev);
-        if (FD_ISSET(udev->uvc_fd, &dfds))
-            uvc_video_process(udev);
-        if (!dummy_data_gen_mode && !mjpeg_image)
-            if (FD_ISSET(vdev->v4l2_fd, &fdsv))
-                v4l2_process_data(vdev);
-    }
-
-    if (!dummy_data_gen_mode && !mjpeg_image && vdev->is_streaming) {
-        /* Stop V4L2 streaming... */
-        v4l2_stop_capturing(vdev);
-        v4l2_uninit_device(vdev);
-        v4l2_reqbufs(vdev, 0);
-        vdev->is_streaming = 0;
-    }
-
-    if (udev->is_streaming) {
-        /* ... and now UVC streaming.. */
-        uvc_video_stream(udev, 0);
-        uvc_uninit_device(udev);
-        uvc_video_reqbufs(udev, 0);
-        udev->is_streaming = 0;
-    }
-
-    if (!dummy_data_gen_mode && !mjpeg_image)
-        v4l2_close(vdev);
-
-    uvc_close(udev);
-    return 0;
+err:
+    usage(argv[0]);
+    return 1;
 }
